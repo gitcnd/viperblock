@@ -1,0 +1,30 @@
+NBD close/open lifecycle race: verification status (honest record)
+===================================================================
+Date: 2026-07-27/28 overnight. Fix under test: connectionLifecycleMutex
+(commit 6a871d2).
+
+Measured:
+- POST-fix plugin: 60 write(4M)+reconnect iterations, 0 failures.
+- PRE-fix plugin (correctly built with GOFIPS140=v1.0.0 after the first
+  attempt crashed on the fipsboot guard): 30 identical iterations,
+  0 race hits.
+
+What this means, stated plainly:
+- The cheap reproducer (4 MiB write then reconnect) does NOT trigger
+  the race even without the fix: its close-side drain window is tens of
+  milliseconds. The one wild occurrence (2026-07-27, during P-1.5
+  benching) followed a ~400 MiB write burst, whose close-side drain to
+  predastore runs for SECONDS -- a much wider window.
+- Therefore the fix is NOT empirically validated by differential
+  reproduction. It stands on: (a) the mechanism being code-evident
+  (Close ends in RemoveLocalFiles; nothing serialises the next Open
+  against it; the wild failure's ENOENT matches exactly), (b) fix-by-
+  construction (a single mutex ordering Open after teardown), and
+  (c) no regression post-fix (60 clean iterations + the plugin builds
+  and serves normally).
+- A faithful reproducer needs a long close-side drain (e.g. 100k-write
+  burst then immediate reconnect, ~5 min/iteration). Queued as a
+  nice-to-have; the fix itself is low-risk regardless.
+
+Also banked: GOFIPS140=v1.0.0 is mandatory when building anything that
+embeds viperblock (fipsboot init panics at runtime otherwise).
