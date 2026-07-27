@@ -1,0 +1,40 @@
+F2 prototype: acked-write durability mechanism latency (P-1.4)
+================================================================
+Date: 2026-07-27. Host: 72-thread Xeon E5-2697v4, Oracle Linux 9.3,
+WAL files on xfs over SATA SSD (Samsung 860 EVO, root disk). Shared,
+loaded machine: absolute fsync latency varied 1.6-5.6 ms p50 between
+runs with ambient IO; the DECISIVE comparisons below are same-run.
+4 KiB records throughout.
+
+Candidate (a) local fsync only -- the single-node floor (quiet-run):
+  local-fsync batch=1   ops/s=181    p50=5627us p99=6583us  max=12758us
+  local-fsync batch=8   ops/s=1349   p50=5880us p99=6569us  max=10815us
+  local-fsync batch=64  ops/s=8802   p50=7431us p99=13997us max=13997us
+  (earlier run, lighter ambient IO: batch=1 p50=1602us, batch=64
+   ops/s=22457 -- fsync cost is ambient-sensitive on this host)
+
+Candidate (b) synchronous peer replication (TCP localhost, group-commit
+fsync on the replica, cumulative acks) -- same run as (a) quiet-run:
+  peer-replicated window=1   ops/s=178   p50=5630us p99=7738us
+  peer-replicated window=64  ops/s=4768  p50=13121us p99=23781us
+  -> replication adds ~3us over local fsync at window=1 (p50 5630 vs
+     5627). On a real LAN add ~0.1-0.5 ms RTT; still fsync-dominated.
+
+Candidate (c) per-write 4 KiB object PUT to predastore (3-node loopback
+cluster, RS 2+1, same host):
+  s3put-4k concurrency=1    ops/s=13   p50=77643us  p99=130057us
+  s3put-4k concurrency=16   ops/s=50   p50=293463us p99=642925us
+  -> 14x-52x worse p50 than (b), throughput two orders of magnitude
+     short; latency degrades under concurrency. UNSUITABLE for acked
+     writes.
+
+Conclusion recorded in spinifex project DECISIONS.md fork F2: LEANING
+option (b) synchronous WAL replication to a peer node; per-write PUTs
+to predastore (c) are rejected on these numbers; ack-after-local-fsync
+(a) remains an interim single-node mode only.
+
+Caveats: localhost TCP understates network RTT; the replica used the
+same physical disk as the primary (a real deployment uses a different
+node's disk -- likely similar or better isolation); group-commit window
+sizing not yet tuned (window=64 p50 reflects batch cap 256 fsync
+grouping, tunable).
