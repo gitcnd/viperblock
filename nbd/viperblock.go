@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
@@ -52,6 +53,18 @@ type ViperBlockConnection struct {
 // (observed when the NBD client is killed while nbdkit is already in SIGTERM
 // shutdown mode).
 var activeVB *viperblock.VB
+
+// connectionLifecycleMutex serialises Open against a still-running Close (or
+// Unload) of the PREVIOUS connection. CanMultiConn=false only guarantees one
+// connection at a time at the NBD layer; nbdkit may still invoke the next
+// connection's Open while the previous connection's Close callback is
+// mid-teardown. Close ends in vb.Close(), which REMOVES the volume's local
+// directory tree (WALs, checkpoints) -- racing that against the next Open's
+// New/RecoverLocalWALs deletes state out from under the new connection.
+// Observed 2026-07-27 during back-to-back qemu-img bench runs: reconnect
+// failed with "WAL recovery: failed to save block state: open
+// .../checkpoints/blocks.00000000.bin: no such file or directory".
+var connectionLifecycleMutex sync.Mutex
 
 // snapshotListener is the unix socket that spinifex connects to before calling
 // CreateSnapshot. The handler calls DrainToBackend and acks "OK\n", ensuring S3
@@ -218,6 +231,11 @@ func (p *ViperBlockPlugin) GetReady() error {
 }
 
 func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+	// Wait for any in-flight Close/Unload teardown of the previous
+	// connection before constructing state it could delete (see
+	// connectionLifecycleMutex).
+	connectionLifecycleMutex.Lock()
+	defer connectionLifecycleMutex.Unlock()
 
 	cfg := s3.S3Config{
 		VolumeName: volume,
@@ -495,6 +513,11 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 }
 
 func (c *ViperBlockConnection) Close() {
+	// Hold the lifecycle mutex so a subsequent Open cannot interleave with
+	// this teardown (vb.Close removes the local volume tree).
+	connectionLifecycleMutex.Lock()
+	defer connectionLifecycleMutex.Unlock()
+
 	slog.Info("Close, flushing block state to disk")
 
 	stopSnapshotListener()
@@ -525,6 +548,9 @@ func (p *ViperBlockPlugin) Unload() {
 			slog.Error("Unload: otel shutdown failed", "err", err)
 		}
 	}()
+
+	connectionLifecycleMutex.Lock()
+	defer connectionLifecycleMutex.Unlock()
 
 	if activeVB == nil {
 		return
