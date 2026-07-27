@@ -31,11 +31,11 @@ import (
 
 // NBD protocol constants (https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md).
 const (
-	nbdMagicOldstyle       = 0x4e42444d41474943 // "NBDMAGIC"
-	nbdMagicOptionRequest  = 0x49484156454F5054 // "IHAVEOPT"
-	nbdMagicOptionReply    = 0x3e889045565a9
-	nbdMagicRequest        = 0x25609513
-	nbdMagicSimpleReply    = 0x67446698
+	nbdMagicOldstyle              = 0x4e42444d41474943 // "NBDMAGIC"
+	nbdMagicOptionRequest         = 0x49484156454F5054 // "IHAVEOPT"
+	nbdMagicOptionReply           = 0x3e889045565a9
+	nbdMagicRequest               = 0x25609513
+	nbdMagicSimpleReply           = 0x67446698
 	nbdHandshakeFlagFixedNewstyle = 1
 	nbdHandshakeFlagNoZeroes      = 2
 
@@ -46,11 +46,11 @@ const (
 	nbdOptionGo              = 7
 	nbdOptionInfo            = 6
 
-	nbdReplyAck                = 1
-	nbdReplyServer             = 2
-	nbdReplyInfo               = 3
-	nbdReplyErrorUnsupported   = 0x80000001
-	nbdInfoExport              = 0
+	nbdReplyAck              = 1
+	nbdReplyServer           = 2
+	nbdReplyInfo             = 3
+	nbdReplyErrorUnsupported = 0x80000001
+	nbdInfoExport            = 0
 
 	nbdCommandRead  = 0
 	nbdCommandWrite = 1
