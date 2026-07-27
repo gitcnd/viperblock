@@ -1,0 +1,28 @@
+cycle   1/25: ran   4.43s, acked=15008 flush_barriers=8 lost_flushed=0 lost_unflushed=1406 corrupt=0 phantom=0
+cycle   2/25: ran   2.24s, acked=22535 flush_barriers=12 lost_flushed=0 lost_unflushed=1641 corrupt=0 phantom=0
+cycle   3/25: ran   2.63s, acked=31376 flush_barriers=17 lost_flushed=0 lost_unflushed=1211 corrupt=0 phantom=0
+cycle   4/25: ran   3.26s, acked=42577 flush_barriers=23 lost_flushed=0 lost_unflushed=1557 corrupt=0 phantom=0
+cycle   5/25: ran   1.74s, acked=48559 flush_barriers=26 lost_flushed=0 lost_unflushed=2045 corrupt=0 phantom=0
+cycle   6/25: ran   3.46s, acked=60199 flush_barriers=32 lost_flushed=0 lost_unflushed=2164 corrupt=0 phantom=0
+cycle   7/25: ran   4.71s, acked=75994 flush_barriers=41 lost_flushed=0 lost_unflushed=685 corrupt=0 phantom=0
+cycle   8/25: ran   4.67s, acked=91662 flush_barriers=50 lost_flushed=0 lost_unflushed=571 corrupt=0 phantom=0
+cycle   9/25: ran   2.20s, acked=98941 flush_barriers=54 lost_flushed=0 lost_unflushed=965 corrupt=0 phantom=0
+cycle  10/25: ran   1.20s, acked=102984 flush_barriers=56 lost_flushed=0 lost_unflushed=1479 corrupt=0 phantom=0
+cycle  11/25: ran   2.86s, acked=112584 flush_barriers=61 lost_flushed=0 lost_unflushed=1482 corrupt=0 phantom=0
+cycle  12/25: ran   3.07s, acked=122817 flush_barriers=67 lost_flushed=0 lost_unflushed=517 corrupt=0 phantom=0
+cycle  13/25: ran   1.28s, acked=127111 flush_barriers=69 lost_flushed=0 lost_unflushed=1382 corrupt=0 phantom=0
+cycle  14/25: ran   3.60s, acked=138999 flush_barriers=76 lost_flushed=0 lost_unflushed=595 corrupt=0 phantom=0
+cycle  15/25: ran   2.91s, acked=148724 flush_barriers=81 lost_flushed=0 lost_unflushed=1735 corrupt=0 phantom=0
+cycle  16/25: ran   2.10s, acked=155681 flush_barriers=85 lost_flushed=0 lost_unflushed=1579 corrupt=0 phantom=0
+cycle  17/25: ran   4.70s, acked=171507 flush_barriers=94 lost_flushed=0 lost_unflushed=643 corrupt=0 phantom=0
+cycle  18/25: ran   3.71s, acked=183999 flush_barriers=101 lost_flushed=0 lost_unflushed=993 corrupt=0 phantom=0
+cycle  19/25: ran   4.37s, acked=198690 flush_barriers=109 lost_flushed=0 lost_unflushed=1447 corrupt=0 phantom=0
+cycle  20/25: ran   1.15s, acked=202512 flush_barriers=111 lost_flushed=0 lost_unflushed=1636 corrupt=0 phantom=0
+cycle  21/25: ran   1.10s, acked=206195 flush_barriers=113 lost_flushed=0 lost_unflushed=1572 corrupt=0 phantom=0
+cycle  22/25: ran   3.56s, acked=218172 flush_barriers=120 lost_flushed=0 lost_unflushed=999 corrupt=0 phantom=0
+cycle  23/25: ran   2.48s, acked=226561 flush_barriers=124 lost_flushed=0 lost_unflushed=2467 corrupt=0 phantom=0
+cycle  24/25: ran   1.97s, acked=233287 flush_barriers=127 lost_flushed=0 lost_unflushed=3454 corrupt=0 phantom=0
+cycle  25/25: ran   4.87s, acked=249635 flush_barriers=136 lost_flushed=0 lost_unflushed=1176 corrupt=0 phantom=0
+CRASHHARNESS SUMMARY: cycles=25 acked_total=249635 lost_flushed=0 lost_unflushed_total=35401 corrupt=0 phantom=0
+PASS: zero acknowledged-and-flushed writes lost
+=== ALL CRASHHARNESS CHECKS PASS ===
