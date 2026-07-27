@@ -36,11 +36,11 @@ const fourKiB = 4096
 const oneTwentyEightKiB = 128 * 1024
 
 type phaseResultRow struct {
-	phaseName     string
-	workerCount   int
-	operationCount int64
-	opsPerSecond  float64
-	megabytesPerSecond float64
+	phaseName                                         string
+	workerCount                                       int
+	operationCount                                    int64
+	opsPerSecond                                      float64
+	megabytesPerSecond                                float64
 	p50Microseconds, p99Microseconds, maxMicroseconds int64
 }
 
