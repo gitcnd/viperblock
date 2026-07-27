@@ -1,0 +1,46 @@
+P-1.5 part (ii): NBD-path measurements (fork F7 evidence)
+==========================================================
+Date: 2026-07-27. Host: 72-thread Xeon E5-2697v4, Oracle Linux 9.3,
+xfs on SATA SSD. nbdkit 1.38.5 (extracted from el9 RPMs, run as user).
+Client/load generator: qemu-img bench (qemu-kvm 7.2), 4 KiB ops,
+100000 ops per cell, NBD over unix socket. Single runs on a shared,
+ambient-loaded host: treat ratios as robust, absolutes as indicative.
+
+A. Transport tax in isolation (same 1 GiB raw file, no viperblock):
+   direct file          read d1 1.160s (86.2k IOPS)  read d16 0.335s (298k IOPS)   write d1 1.239s (80.7k IOPS)
+   nbdkit file plugin   read d1 2.978s (33.6k IOPS)  read d16 1.276s (78.4k IOPS)  write d1 3.097s (32.3k IOPS)
+   -> nbdkit + NBD framing costs 2.5-3.8x on 4 KiB IO even with
+      nbdkit's native C plugin: ~+18-19 us per depth-1 op.
+
+B. Production path (nbdkit + viperblock Go plugin + predastore
+   3-node loopback backend, 1 GiB volume, 64 MiB cache):
+   write d1  6.598s  (15.2k IOPS, ~66 us/op)
+   write d16 8.232s  (12.1k IOPS -- SLOWER than d1: write-lock
+             contention, matches the engine baseline's 16-worker result)
+   read  d1  227.950s (439 IOPS, ~2.28 ms/op -- cache misses pay a
+             predastore chunk GET; production read latency incl. backend)
+   read  d16 19.628s  (5.1k IOPS)
+
+C. Context (engine-level frozen baseline, FILE backend -- different
+   backend, so compare shapes not absolutes):
+   WriteAt p50 5 us; randread 6.1k IOPS @1 / 92.6k @16; the engine acks
+   writes in microseconds, so the write-path gap to B is transport+plugin.
+
+Findings for F7:
+1. The human's bottleneck call is confirmed: nbdkit alone takes 2.5-3.8x
+   off 4 KiB IOPS (A), and the full plugin path lands at 15.2k write
+   IOPS where the engine acks in ~5 us (B vs C).
+2. Depth scaling is broken twice: nbdkit-file d16 gains only 2.3x over
+   d1 (A), and viperblock writes REGRESS with depth (B) due to engine
+   lock contention -- a data-path replacement must be paired with
+   engine-side concurrency work to matter.
+3. Read latency is backend-dominated (2.28 ms/op at d1): for reads, the
+   cache/chunk layer matters more than the transport.
+
+BUG FILED (found by this rig): reconnecting to the nbdkit plugin after
+an unclean client disconnect triggered WAL recovery that failed with
+"failed to save block state: open .../checkpoints/blocks.00000000.bin:
+no such file or directory" -- the volume was unserveable for that
+connection. Local checkpoints directory creation is missing on the
+recovery path when the WAL base_dir was freshly seeded. Tracked in the
+spinifex project STATUS backlog; fix belongs on the durability branch.
