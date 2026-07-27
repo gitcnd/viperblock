@@ -1,0 +1,32 @@
+P-1.9 candidate (a): native Go NBD server vs nbdkit (fork F7)
+==============================================================
+Date: 2026-07-27. Same rig as 2026-07-27_nbd_path_vs_direct.txt section B:
+qemu-img bench, 4 KiB, 100000 ops, unix socket, viperblock engine with
+predastore 3-node loopback backend, 1 GiB volume, 64 MiB cache. Single
+runs on a shared host; ratios indicative, +-10% ambient noise plausible.
+
+                     nbdkit + Go plugin        native Go NBD server
+write d1             6.598s (15.2k IOPS)       6.197s (16.1k IOPS)  +6%
+write d16            8.232s (12.1k IOPS)       10.007s (10.0k IOPS) -17%
+read  d1             227.950s (439 IOPS)       255.738s (391 IOPS)  -11%
+read  d16            19.628s (5.1k IOPS)       21.780s (4.6k IOPS)  -10%
+
+Conclusion for F7: eliminating the nbdkit process is NOT where the win
+is -- a same-protocol Go server lands within noise of nbdkit. The
+depth-1 cost is dominated by the NBD request/reply round trip (two
+socket syscalls + wakeups per op) which ANY NBD server pays, and by the
+engine (writes regress with depth on its global write lock) and backend
+(reads pay predastore chunk GETs). Implications:
+  1. Candidate (a) native-NBD is still worth shipping for OPERATIONAL
+     reasons (drops the C shim, the packaging gap, and a process), but
+     must not be sold as a performance fix.
+  2. The performance endgame remains vhost-user-blk (candidate b):
+     shared-memory virtio rings remove the per-op socket round trip
+     entirely. That is a real build (vhost-user protocol + virtqueue
+     handling), not a day prototype.
+  3. Engine write-lock contention and read/cache behaviour must be
+     fixed alongside, or the transport change will not show end to end.
+
+Prototype caveats: unbuffered per-reply socket writes, one allocation
+per op, reply mutex serialisation -- a tuned NBD server could close its
+-10..-17% gaps to nbdkit but cannot beat the protocol's round trip.
