@@ -1,0 +1,16 @@
+2026/07/27 08:18:36 INFO Init for file backend volumeName=perfbench-vol0
+2026/07/27 08:18:36 INFO No state found in local file, using backend state error="open /tmp/pb_baseline/vb/perfbench-vol0/config.json: no such file or directory"
+2026/07/27 08:18:36 WARN Failed to load state from backend error="open /tmp/pb_baseline/backend/perfbench-vol0/config.json: no such file or directory"
+2026/07/27 08:18:36 INFO No state found in local file, using backend state error="stat /tmp/pb_baseline/vb/perfbench-vol0/checkpoints/blocks.00000000.bin: no such file or directory"
+# perfbench: engine-level, volume 1024 MiB, 10s per phase, cache 64 MiB (see harness config)
+randwrite-4k             workers=1  ops=81944     iops=8194      MB/s=32.0     p50=5us p99=35us max=175832013us
+randwrite-4k             workers=16 ops=65552     iops=6555      MB/s=25.6     p50=11us p99=445us max=419884007us
+flush-after-4MiB-dirty   workers=1  ops=83        iops=8         MB/s=0.0      p50=8879us p99=100720us max=100720us
+# prefill complete (volume fully written and drained)
+randread-4k              workers=1  ops=61390     iops=6139      MB/s=24.0     p50=158us p99=395us max=6032us
+randread-4k              workers=16 ops=926108    iops=92611     MB/s=361.8    p50=167us p99=441us max=4293us
+seqwrite-128k            workers=1  ops=9410      iops=941       MB/s=117.6    p50=102us p99=244us max=2061433us
+2026/07/27 08:42:33 INFO VB Close, flushing block state to disk
+2026/07/27 08:42:33 INFO Removing local files path=/tmp/pb_baseline/vb/perfbench-vol0
+# csv written: /tmp/pb_baseline.csv
+=== PERFBENCH COMPLETE ===
