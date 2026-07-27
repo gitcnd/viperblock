@@ -1,0 +1,36 @@
+3274293 11:23:27.842946 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274290 11:23:27.847964 fsync(5)        = 0
+3274290 11:23:27.859338 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274290 11:23:27.859571 fsync(5)        = 0
+3274294 11:23:30.846920 fsync(5)        = 0
+3274294 11:23:31.447450 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274294 11:23:32.447921 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274294 11:23:38.247012 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274294 11:23:41.447025 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274294 11:23:42.647037 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:46.246945 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:53.446954 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:53.847045 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:55.846959 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.847199 fsync(5)        = 0
+3274293 11:23:57.851820 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.852293 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.852633 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.852929 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.852997 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.853230 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.853509 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.853586 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.853792 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854037 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854122 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854363 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854618 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854879 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.854955 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.855032 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.855131 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.855314 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274293 11:23:57.855651 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274292 11:23:57.855723 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
+3274290 11:23:57.855768 --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=3274290, si_uid=513} ---
