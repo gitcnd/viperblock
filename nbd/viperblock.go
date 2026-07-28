@@ -233,6 +233,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		VolumeName: volume,
 		VolumeSize: size,
 		BaseDir:    base_dir,
+		// Data-path engine. Recorded on the volume-open metric so a volume
+		// simultaneously held by a control-plane import is visible.
+		Role: "nbdkit",
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -417,7 +420,7 @@ func (c *ViperBlockConnection) CanMultiConn() (bool, error) {
 }
 
 func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) error {
-	slog.Info("PREAD:", "offset", offset, "len", len(buf))
+	slog.Debug("PREAD:", "offset", offset, "len", len(buf))
 	data, err := c.vb.ReadAt(offset, uint64(len(buf)))
 	if err != nil && err != viperblock.ErrZeroBlock {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
@@ -456,7 +459,7 @@ func (c *ViperBlockConnection) CanZero() (bool, error) {
 
 func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) error {
 
-	slog.Info("ZERO:", "len", count, "offset", offset)
+	slog.Debug("ZERO:", "len", count, "offset", offset)
 
 	if count == 0 {
 		return nil
@@ -479,7 +482,7 @@ func (c *ViperBlockConnection) CanTrim() (bool, error) {
 
 func (c *ViperBlockConnection) Trim(count uint32, offset uint64, flags uint32) error {
 
-	slog.Info("TRIM:", "len", count, "offset", offset)
+	slog.Debug("TRIM:", "len", count, "offset", offset)
 
 	return nil
 }

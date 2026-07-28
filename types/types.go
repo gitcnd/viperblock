@@ -14,6 +14,14 @@ import (
 // viperblock, so can't import it back).
 var ErrNoSpace = errors.New("viperblock: backend out of space")
 
+// ErrShortRead is returned when a backend answers a ranged read with fewer
+// bytes than were requested without reporting an error of its own. S3-style
+// backends clamp a range that runs past the end of an object into a short
+// 206 with a matching Content-Length, so nothing upstream notices; callers
+// would otherwise copy that short body into a zero-initialised buffer and
+// cache the zero-filled tail as though it were real data.
+var ErrShortRead = errors.New("viperblock: backend returned a short read")
+
 type Backend interface {
 	Init() error
 	InitCtx(ctx context.Context) error
@@ -63,6 +71,7 @@ const (
 	FileTypeSSHAuthKey
 	FileTypeWALChunkShard
 	FileTypeBlockCheckpointLive
+	FileTypeSnapshotMarker
 )
 
 // getFilePath returns the appropriate S3 path based on file type and objectId.
@@ -86,6 +95,10 @@ func GetFilePath(fileType FileType, objectId uint64, volumeName string) string {
 		return fmt.Sprintf("%s/wal/chunks/wal.%08d.shard_%02d.bin", volumeName, walNum, shardID)
 	case FileTypeBlockCheckpointLive:
 		return fmt.Sprintf("%s/checkpoints/blocks.live.bin", volumeName)
+	// One fixed key per volume, so a reader locates the most recent snapshot
+	// of a volume with a single GET rather than a listing.
+	case FileTypeSnapshotMarker:
+		return fmt.Sprintf("%s/snapshots.marker", volumeName)
 	default:
 		return fmt.Sprintf("%s/unknown.%08d.bin", volumeName, objectId)
 	}
