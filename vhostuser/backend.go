@@ -379,7 +379,10 @@ func (b *Backend) serveQueueUntilStopped() {
 		b.queueAccessMutex.Lock()
 		queue := b.queueState.queue
 		chains, err := queue.PopAvailableChains()
-		b.Logger.Info("kick", "chains", len(chains), "err", err)
+		// Demoted Info->Debug 2026-07-28: this fires per kick on the I/O hot
+		// path; at 28k IOPS the Info-level formatting cost was measured into
+		// the P-1.9 fio numbers. Per-request logging is debug-only.
+		b.Logger.Debug("kick", "chains", len(chains), "err", err)
 		if err != nil {
 			b.queueAccessMutex.Unlock()
 			b.Logger.Error("vhost-user: ring walk failed", "err", err)
@@ -415,7 +418,8 @@ func (b *Backend) processBlockRequest(chain *DescriptorChain) uint32 {
 	header := chain.ReadableSpans[0]
 	requestType := binary.LittleEndian.Uint32(header[0:4])
 	sector := binary.LittleEndian.Uint64(header[8:16])
-	b.Logger.Info("blk req", "type", requestType, "sector", sector, "readable", len(chain.ReadableSpans), "writable", len(chain.WritableSpans))
+	// Demoted Info->Debug 2026-07-28: per-request hot-path log (see kick note).
+	b.Logger.Debug("blk req", "type", requestType, "sector", sector, "readable", len(chain.ReadableSpans), "writable", len(chain.WritableSpans))
 	offsetBytes := sector * virtioBlockSectorSizeBytes
 	statusSpan := chain.WritableSpans[statusSpanIndex]
 	dataWritableSpans := chain.WritableSpans[:statusSpanIndex]
