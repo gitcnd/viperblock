@@ -1356,19 +1356,29 @@ func (vb *VB) syncWALIfDirty() {
 	// Clear dirty flag before sync (writes during sync will re-set it)
 	vb.WAL.dirty.Store(false)
 
+	// Take the handle under the lock but run the fsync OUTSIDE it (P1.6
+	// slice 3, 2026-07-28): an fsync flushing a large dirty burst (a
+	// drain's flush phase writes up to MaxPendingBytes into the WAL
+	// between ticks) takes seconds, and holding even the read side of
+	// WAL.mu across it blocked every WriteWAL append (write lock) for the
+	// whole fsync -- one link in the multi-second guest write stalls.
+	// os.File tolerates concurrent Write+Sync; appends racing this fsync
+	// re-set the dirty flag and are covered next tick. A WAL rotation
+	// (write lock) can close this handle mid-fsync; that surfaces as a
+	// benign sync error here, the flag re-arms, and the next tick syncs
+	// the new active segment.
 	vb.WAL.mu.RLock()
-	defer vb.WAL.mu.RUnlock()
-
-	// Only sync the current active WAL (last in slice)
-	// Previous WAL files are already closed after chunking
+	var activeWAL *os.File
 	if len(vb.WAL.DB) > 0 {
-		activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-		if activeWAL != nil {
-			if err := activeWAL.Sync(); err != nil {
-				vb.logger().Error("WAL sync failed", "error", err)
-				// Re-mark as dirty so next tick retries
-				vb.WAL.dirty.Store(true)
-			}
+		activeWAL = vb.WAL.DB[len(vb.WAL.DB)-1]
+	}
+	vb.WAL.mu.RUnlock()
+
+	if activeWAL != nil {
+		if err := activeWAL.Sync(); err != nil {
+			vb.logger().Error("WAL sync failed", "error", err)
+			// Re-mark as dirty so next tick retries
+			vb.WAL.dirty.Store(true)
 		}
 	}
 }
