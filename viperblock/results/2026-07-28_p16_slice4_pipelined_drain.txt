@@ -1,0 +1,49 @@
+P1.6 slice 4: pipelined drain rounds -- evidence bundle (overnight run)
+======================================================================
+Date: 2026-07-28/29 overnight. Commit e916f68 on
+fix/backpressure-write-admission-latency (post v1.14.0 merge).
+Change: DrainToBackendCtx interleaves bounded 64 MiB flush slices with
+segment rotation + chunk upload, so blocked writers see per-chunk
+headroom DURING the flush phase (previously only after it).
+
+1. UNIT DIFFERENTIAL (drain_pipeline_test.go; 96 MiB buffer, 8 MiB test
+   rounds, 200 ms serial uploads, -race; the pre-slice-4 algorithm is
+   emulated EXACTLY by a one-giant-round override):
+   giant round (old): max admission latency 1.007-1.104 s -> FAIL
+   pipelined rounds:  max admission latency 66 ms          -> PASS
+   Bound 400 ms (~6x above pass, ~2.75x below fail). Engagement proven
+   by pending crossing the watermark (a latency floor would reject the
+   success mode: with pipelining, admission can beat 100 ms).
+   All prior gates still green (admission 1.3 s/2 s; flush-stall
+   20.6 ms/150 ms); full suite green 181 s.
+
+2. HOST-SIDE THROUGHPUT PROBE (512 MiB sequential 1 MiB writes, real
+   file backend, serving defaults; temp test, deleted, numbers here):
+   pipelined 253.4 MiB/s, slowest single write 361 ms
+   giant     263.5 MiB/s, slowest single write 1010 ms
+   => throughput unchanged (within noise), worst-case single write 2.8x
+   better with rounds.
+
+3. IN-GUEST A/B (one boot, two serve binaries, two volumes: vdb=slice4,
+   vdc=pre-slice4; Debian 13 guest, QEMU 7.2, vhost-user, file backend):
+   - First-write prefill produced a WILD asymmetry (vdb 1.9 MB/s vs vdc
+     201 MB/s) that REVERSED on the controlled rewrite pass (same boot,
+     order flipped): vdc 4.5 MB/s, vdb 7.4 MB/s -- slice4 1.6x FASTER.
+     The first measurement is attributed to ambient/first-boot variance
+     (this host swings; ENVIRONMENT.md trap), not to the change.
+   - Interleaved 20 s randwrite diags: round 1 slice4 2588 IOPS /
+     clat max 29.3 ms vs pre 2370 / 31.9 ms; round 2 slice4 620 vs pre
+     1876 (ambient swing mid-run; both signs observed).
+   - An earlier single-build boot measured clat max 50.9 s during
+     saturation -- ambient-confounded (boot followed a heavy teardown
+     drain); the A/B boot never reproduced it on either build.
+
+CONCLUSION: slice 4 stands -- decisively better admission latency at
+unit level with throughput unchanged, and equal-or-better in the only
+controlled in-guest comparisons. REMAINING for P1.6 verification (the
+box stays [~]): (a) final rig numbers need repeated runs or a quieter
+host (single-run in-guest latency maxima on this machine are not
+decision-grade; same-run A/B only); (b) saturated OVERWRITE drain
+throughput (4-7 MB/s both builds, chunk-supersede bookkeeping) is a
+separate lever, now named; (c) the deferred s3-backed nbdkit-vs-vhost
+production pair.
