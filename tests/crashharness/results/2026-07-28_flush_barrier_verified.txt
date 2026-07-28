@@ -1,0 +1,24 @@
+P1.4 slice 1 verification: SyncOnFlush barrier, end-to-end via nbdkit
+=====================================================================
+Date: 2026-07-28. Plugin built from feat/replicated-wal-durability
+(SyncOnFlush enabled in the plugin), served via nbdkit over unix socket
+against the predastore 3-node loopback cluster; strace -f -tt on the
+serving process, qemu-io as the NBD client.
+
+BEFORE (2026-07-27, 2026-07-27_flush_no_fsync_finding.txt): 50 explicit
+NBD flushes -> ZERO fsync-family syscalls.
+
+AFTER:
+- 1 write + 50 flushes: fsyncs only where data was dirty (first
+  barrier), later empty barriers correctly skip the fsync -- a barrier
+  with nothing new to persist need not sync.
+- 20 interleaved write+flush pairs: 24 fsyncs total = 20 barrier
+  fsyncs + open/close-path syncs (raw trace:
+  2026-07-28_flush_barrier_verified.strace). qemu-io confirmed all 20
+  writes acknowledged.
+
+Guest fsync on the served path is now power-loss durable up to the
+local disk's guarantees. Remaining for full P1.4: the volatile-cache
+FUSE loss-count rig (verifies the fix under simulated power loss), and
+extending the barrier over F2 peer replication when the transport
+lands.
