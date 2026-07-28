@@ -1,0 +1,37 @@
+F7 decision evidence: in-guest fio, vhost-user-blk vs NBD vs plain virtio
+==========================================================================
+Date: 2026-07-28. Host: Xeon E5-2697v4, Oracle Linux 9.3. Guest: Debian
+13, kernel 6.12, 4 vCPU / 2 GiB, QEMU 7.2 (qemu-kvm), machine
+q35 + memory-backend-memfd,share=on. Load generator: fio in the GUEST,
+4 KiB, --direct=1, --time_based 10s, numjobs=1. Same 512 MiB raw-file
+backend content for all three paths, same guest, same run.
+
+Three block devices attached simultaneously:
+  vdb = vhost-user-blk  -> our pure-Go backend (viperblock branch
+        feat/data-path-vhost-user-blk, vhost-user-blk-serve --raw-file)
+  vdc = virtio-blk over QEMU -drive nbd:  -> nbdkit file plugin (the
+        CURRENT spinifex data path's transport)
+  vdd = virtio-blk over QEMU -drive file: -> QEMU's own block layer
+
+Results (IOPS):
+  path         randwrite d1   randwrite d16   randread d1   randread d16
+  vhost-user      28.5k          28.3k           24.8k          25.5k
+  nbd (nbdkit)    15.7k          16.4k           18.4k          18.3k
+  plain virtio    14.3k          16.1k           19.0k          18.2k
+
+Read of the numbers:
+- vhost-user-blk is ~1.8x the NBD path on random writes (28.5k vs 15.7k)
+  and ~1.35x on random reads (24.8k vs 18.4k).
+- vhost-user even beats QEMU's OWN plain virtio-blk-over-file on writes
+  (28.5k vs 14.3k): shared-memory virtqueues let the Go backend service
+  the ring without the per-op host syscall + QEMU block-layer hop.
+- No write regression with queue depth for vhost-user (28.5k -> 28.3k),
+  unlike the viperblock ENGINE's own depth regression measured earlier
+  against the real engine -- here the raw-file engine isolates transport.
+
+Caveats: raw-file engine (not the viperblock WAL engine) so this
+isolates the TRANSPORT, which is exactly the F7 question; the
+viperblock-engine-behind-vhost integration + its own concurrency remain
+separate work. Single run; ratios are large and stable enough to decide.
+
+Conclusion: F7 -> vhost-user-blk, on evidence. See spinifex DECISIONS.md.
