@@ -1,0 +1,57 @@
+P1.6 drain-stall fix, evidence bundle (spinifex gate P1.6, fork F7
+critical path)
+===================================================================
+Date: 2026-07-28. Fix: viperblock commit 5e958b3 on
+fix/backpressure-write-admission-latency (cut from main 4f75d90).
+Change: awaitBackpressure releases blocked writers on per-chunk HEADROOM
+at the high watermark instead of holding one writer through a full
+drain to the low watermark; the background uploader owns drains when
+running; ErrNoSpace + consecutive-failure contracts preserved at the
+DrainToBackendCtx choke point.
+
+1. UNIT DIFFERENTIAL (viperblock/backpressure_test.go,
+   TestWriteAtAdmissionLatencyBoundedWithUploader; 48 MiB watermark,
+   300 ms/backend-write, serial uploads):
+   OLD contract: FAIL -- max admission latency 4.65 s (full drain).
+   NEW contract: PASS -- max admission latency 1.17 s under -race
+   (release on first freed chunk; flush phase dominates).
+   Full package suite green post-fix: 185.8 s, all tests.
+
+2. IN-GUEST VERIFICATION (same rig as 2026-07-28_inguest_fio_real_
+   engine_vs_raw_vhost.txt on the vhost branch: Debian 13 guest,
+   QEMU 7.2, vhost-user-blk, REAL engine file-backed 512 MiB volume,
+   serve binary built from vhost branch c28dfbe + this fix, merge
+   worktree, GOFIPS140=v1.0.0. Raw-file device attached same boot as
+   control):
+                          PRE-FIX          POST-FIX        change
+   randwrite d1           592 IOPS         4083 IOPS       6.9x
+   randwrite d16          324 IOPS         2261 IOPS       7.0x
+   randread  d1           3099 IOPS        8209 IOPS       2.6x
+   randread  d16          3089 IOPS        7104 IOPS       2.3x
+   raw-file control       34.9-36.8k both runs (rig consistent)
+   diag leg (randwrite d1, latency distribution):
+     p99                  65 us            65 us
+     burst avg IOPS       27.3k            27.3k
+     clat MAX             246,097 ms       35,260 ms       7.0x
+     wall for 10s/30s job 248.8 s          36.5 s
+   Integrity: 16 MiB round-trip byte-identical both runs; matrix wall
+   time collapsed from ~8+ min (stall-inflated) to 99 s.
+
+3. RESIDUAL STALL ROOT-CAUSED (discriminating probe, temporary test,
+   numbers preserved here + journal; probe deleted after run):
+   Fill 256 MiB buffered (65,536 records), concurrent 4 KiB writer
+   sampling every 5 ms, then direct Flush():
+     flush duration          724.7 ms
+     concurrent WriteAt max  721.5 ms   (pre-flush max 49 us)
+   => flushLocked holds Writes.mu for the ENTIRE flush; every write
+   admitted past backpressure stalls behind it in WriteAtCtx. At
+   in-guest scale (multi-GiB WAL file, 200 ms WAL-syncer fsyncs, chunk
+   assembly running concurrently) this phase stretches to the observed
+   ~35 s. The admission fix cannot bound this; it is a separate
+   mechanism.
+
+REMAINING for P1.6 (the only remaining content of the gate): bound the
+flush lock-hold -- flush in bounded batches releasing Writes.mu between
+them (and/or move per-record WAL appends off the lock), plus WAL
+segment rotation so syncer fsyncs stay bounded; then re-run this rig
+and set the final numeric bound (100 ms-class target) with the human.
