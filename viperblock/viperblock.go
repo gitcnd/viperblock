@@ -241,6 +241,12 @@ type VB struct {
 	// never take flushMu -- that independence is the entire point.
 	flushMu sync.Mutex
 
+	// drainRoundRecordsOverrideForTests shrinks DrainToBackendCtx's
+	// pipelined-round size (default 4 x flushBatchedBlocksPerLockRelease)
+	// so unit tests can exercise many rounds against a small buffer. 0 =
+	// production default. Only tests set it.
+	drainRoundRecordsOverrideForTests int
+
 	// rmwLocks serialize each block's read-modify-write cycle in WriteAtCtx,
 	// sharded by block number. See writeOneBlockLocked.
 	rmwLocks [NumShards]sync.Mutex
@@ -2151,7 +2157,27 @@ func (vb *VB) Flush() (err error) {
 		defer vb.Writes.mu.Unlock()
 		return vb.flushLockedSharded()
 	}
-	return vb.flushBatchedLegacy()
+	vb.Writes.mu.Lock()
+	entryRecords := len(vb.Writes.Blocks)
+	vb.Writes.mu.Unlock()
+	_, err = vb.flushBatchedLegacy(entryRecords)
+	return err
+}
+
+// drainFlushRound flushes up to budgetRecords buffered records to the WAL
+// under flushMu, for DrainToBackendCtx's pipelined rounds (P1.6 slice 4).
+// Returns the number of records actually flushed.
+func (vb *VB) drainFlushRound(budgetRecords int) (int, error) {
+	vb.flushMu.Lock()
+	defer vb.flushMu.Unlock()
+	if vb.UseShardedWAL {
+		// Sharded WAL keeps whole-buffer flush semantics; rounds do not
+		// apply (DrainToBackendCtx does not use rounds on that path).
+		vb.Writes.mu.Lock()
+		defer vb.Writes.mu.Unlock()
+		return 0, vb.flushLockedSharded()
+	}
+	return vb.flushBatchedLegacy(budgetRecords)
 }
 
 // flushBatchedBlocksPerLockRelease bounds how many buffered blocks one
@@ -2184,10 +2210,11 @@ const flushBatchedBlocksPerLockRelease = 4096
 //     and would lose the rewrite).
 //   - Snapshot order is preserved batch to batch (head of the buffer
 //     first), so per-block WAL record order remains SeqNum order.
-//   - Only the entries present when this Flush began are flushed (the
-//     entry-count budget): writes landing mid-flush belong to the next
-//     flush, matching the old snapshot semantics and bounding this
-//     flush's duration under sustained load.
+//   - Only budgetRecords entries are flushed per call (Flush passes its
+//     entry-time count; DrainToBackendCtx passes per-round slices, P1.6
+//     slice 4): writes landing mid-flush belong to a later flush/round,
+//     matching the old snapshot semantics and bounding each call's
+//     duration under sustained load.
 //   - Successfully appended entries move to PendingBackendWrites BEFORE
 //     being removed from Writes.Blocks, so the scanning read path always
 //     finds hot-or-pending data in at least one tier (hot wins ties).
@@ -2195,12 +2222,9 @@ const flushBatchedBlocksPerLockRelease = 4096
 //     an off-lock flush of a superseded record must not mark the newer
 //     hot rewrite as pending (mirror of MarkPersisted's stale-drain
 //     guard).
-func (vb *VB) flushBatchedLegacy() error {
-	vb.Writes.mu.Lock()
-	remainingBudget := len(vb.Writes.Blocks)
-	vb.Writes.mu.Unlock()
-
-	totalAtStart := remainingBudget
+func (vb *VB) flushBatchedLegacy(budgetRecords int) (int, error) {
+	remainingBudget := budgetRecords
+	totalAtStart := budgetRecords
 	writtenTotal := 0
 
 	for remainingBudget > 0 {
@@ -2253,11 +2277,11 @@ func (vb *VB) flushBatchedLegacy() error {
 		remainingBudget -= batchLen
 
 		if writeErr != nil {
-			return fmt.Errorf("partial flush: %d of %d records flushed", writtenTotal, totalAtStart)
+			return writtenTotal, fmt.Errorf("partial flush: %d of %d records flushed", writtenTotal, totalAtStart)
 		}
 	}
 
-	return nil
+	return writtenTotal, nil
 }
 
 // DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
@@ -2299,16 +2323,59 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		}
 	}()
 
-	if err = vb.Flush(); err != nil {
-		return fmt.Errorf("drain flush: %w", err)
-	}
 	if vb.UseShardedWAL {
-		err = vb.WriteShardedWALToChunkCtx(ctx, true)
+		// Sharded path keeps the original flush-everything-then-chunk
+		// shape (not the serving default; rounds do not apply).
+		if err = vb.Flush(); err != nil {
+			return fmt.Errorf("drain flush: %w", err)
+		}
+		if err = vb.WriteShardedWALToChunkCtx(ctx, true); err != nil {
+			return fmt.Errorf("drain chunk upload: %w", err)
+		}
 	} else {
-		err = vb.WriteWALToChunkCtx(ctx, true)
-	}
-	if err != nil {
-		return fmt.Errorf("drain chunk upload: %w", err)
+		// PIPELINED ROUNDS (P1.6 slice 4, 2026-07-28): flush a bounded
+		// slice of the entry-time buffer, then immediately rotate + chunk
+		// + upload it, and repeat. pendingBytes falls per uploaded chunk
+		// (createChunkFile), so a writer blocked at the high watermark is
+		// released after ~one round -- previously the drain flushed the
+		// ENTIRE buffer before the first chunk upload could free anything,
+		// and the blocked writer waited out the whole flush phase
+		// (measured 16.3 s in-guest at a 256 MiB buffer even with the
+		// batched flush; see viperblock/results/2026-07-28_p16_slice2_
+		// slice3_flush_and_fsync.txt). The round budget comes from the
+		// entry snapshot, so a drain cannot chase concurrent writers
+		// forever; records arriving mid-drain (including guest-barrier
+		// flushes between rounds, which flushMu permits by design) are
+		// picked up by later rounds' segment rotations or the next drain.
+		vb.Writes.mu.Lock()
+		entryRecords := len(vb.Writes.Blocks)
+		vb.Writes.mu.Unlock()
+
+		drainRoundRecords := 4 * flushBatchedBlocksPerLockRelease // 64 MiB of 4 KiB blocks
+		if vb.drainRoundRecordsOverrideForTests > 0 {
+			drainRoundRecords = vb.drainRoundRecordsOverrideForTests
+		}
+		remaining := entryRecords
+		for {
+			roundBudget := min(drainRoundRecords, remaining)
+			flushed := 0
+			if roundBudget > 0 {
+				if flushed, err = vb.drainFlushRound(roundBudget); err != nil {
+					return fmt.Errorf("drain flush: %w", err)
+				}
+			}
+			// Chunk what this round flushed (plus anything a concurrent
+			// barrier flush appended to the segment). Runs at least once
+			// per drain even with an empty buffer, matching the previous
+			// contract (segment rotation on every drain).
+			if err = vb.WriteWALToChunkCtx(ctx, true); err != nil {
+				return fmt.Errorf("drain chunk upload: %w", err)
+			}
+			remaining -= roundBudget
+			if remaining <= 0 || flushed < roundBudget {
+				break
+			}
+		}
 	}
 	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		return fmt.Errorf("drain live checkpoint: %w", err)
