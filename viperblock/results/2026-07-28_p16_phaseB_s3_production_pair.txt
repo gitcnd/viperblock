@@ -1,0 +1,38 @@
+P1.6 final verification, phase B: s3-backed production pair
+(vhost-user vs nbdkit, REAL engine, predastore backend)
+============================================================
+Date: 2026-07-28 (evening). Builds: BOTH legs use the identical engine
+(vhost branch 582eb18 + fix branch ff6b2cb merge): vdb = vhost-user-blk
+serve --vb-backend s3; vdc = nbdkit 1.38.5 (rpm-extracted, user-space)
++ the viperblock cgo plugin built from the same merge (GOFIPS140).
+Backend: 3-node predastore loopback cluster (post-v1.14.0 merge),
+bucket f7pair, two 512 MiB volumes seeded via the serve's first-open
+path. One guest boot, interleaved legs, 30 s randwrite 4 KiB d1.
+
+  round  vhost IOPS  vhost clatmax  vhost p99 | nbdkit IOPS  clatmax  p99
+  1        1244        55.2 ms       82 us    |   1275       53.3 ms  137 us
+  2         282       109.3 ms       73 us    |    392       80.9 ms  163 us
+  3         828        27.6 ms       76 us    |    184       87.7 ms  143 us
+  prefill (seq 1 MiB): vhost 106 MiB/s | nbdkit 83.6 MiB/s (1.27x)
+
+Reading:
+- p99 write latency (transport-dominated): vhost 73-82 us vs nbdkit
+  137-163 us -- the ~2x per-op transport advantage measured on raw
+  files (P-1.9) HOLDS with the production engine and backend.
+- Steady IOPS is drain-rate-bound and ambient-noisy on both legs
+  (vhost 282-1244, nbdkit 184-1275; medians 828 vs 392). Same class;
+  vhost trends better. The overwrite-throughput lever (chunk-supersede
+  bookkeeping) dominates both -- unchanged conclusion.
+- clat max across ALL SIX saturated legs: 27.6-109.3 ms. The P1.6
+  latency work holds end-to-end on the production backend: the
+  246 s / 35 s / 16 s stall generations are gone; worst case is the
+  backend chunk-PUT tail, as predicted.
+- PROPOSED P1.6 BOUND (both backends measured): no single 4 KiB write
+  under sustained saturation exceeds 250 ms across a repeated-run
+  distribution. Evidence: file backend 5-run max 67 ms (phase A);
+  s3/predastore 6-leg max 109.3 ms (this file) -- 2.3-3.7x margins.
+  Awaiting human ack to freeze the number into the gate.
+
+Caveats: single boot per phase (interleaving controls drift within the
+boot); loopback cluster (no real network); reads not re-measured here
+(backend-dominated, unchanged from P-1.5(ii)/P-1.9 analysis).
