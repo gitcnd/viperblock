@@ -141,6 +141,14 @@ type VB struct {
 	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
 	WALSyncInterval time.Duration
 
+	// bgMu serialises the start and stop of the background goroutines (the
+	// WAL syncer, the chunk uploader, and the GC sweeper). Their control
+	// fields below are otherwise a check-then-act that concurrent stoppers — a
+	// SIGTERM sweep racing a NATS unmount, say — turn into a double close or a
+	// nil-channel receive. Held across the wait for the goroutine to exit, so
+	// "stop returned" means "stopped" for every caller, not just the first.
+	bgMu sync.Mutex
+
 	// WAL syncer control (background goroutine for periodic fsync)
 	walSyncTicker *time.Ticker
 	walSyncStop   chan struct{}
@@ -205,6 +213,29 @@ type VB struct {
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
 
+	// rmwLocks serialize each block's read-modify-write cycle in WriteAtCtx,
+	// sharded by block number. See writeOneBlockLocked.
+	rmwLocks [NumShards]sync.Mutex
+
+	// rmwConflicts counts partial writes that found another write already
+	// rebuilding the same block. Non-zero means guest I/O is producing
+	// same-block write concurrency -- the precondition for the lost-update
+	// class this locking removes.
+	rmwConflicts atomic.Uint64
+
+	// rmwHolders records which block owns each rmwLocks shard, as block+1 so
+	// the zero value reads as "free". There are only NumShards locks for the
+	// whole volume, so a failed TryLock is USUALLY two different blocks
+	// colliding on one shard; counting those as conflicts would report
+	// contention that has nothing to do with the lost-update class. Comparing
+	// the holder against the incoming block separates the two.
+	rmwHolders [NumShards]atomic.Uint64
+
+	// rmwShardCollisions counts the other case: a failed TryLock where the
+	// shard was held by a DIFFERENT block. Harmless to correctness, but a high
+	// rate means NumShards is too small for the write concurrency in play.
+	rmwShardCollisions atomic.Uint64
+
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
 	// to drain now instead of waiting for the next ChunkUploadInterval tick,
 	// once pendingBytes crosses FlushSize. Buffered 1: a pending trigger
@@ -218,6 +249,13 @@ type VB struct {
 	// ShardedWAL splits the WAL into NumShards parallel files for reduced lock contention.
 	// When UseShardedWAL is true, writes route through ShardedWAL instead of WAL.
 	ShardedWAL *ShardedWAL
+
+	// Role labels which engine constructed this VB: "nbdkit" for the data-path
+	// plugin, "daemon" for a control-plane import. Emitted with the
+	// volume-open metric so a volume held by more than one engine is visible
+	// as a metric rather than something to infer by correlating logs. Empty
+	// is allowed and reported as unset.
+	Role string
 
 	// UseShardedWAL enables the sharded WAL for write operations.
 	// When false, uses the legacy single-file WAL for backward compatibility.
@@ -332,18 +370,24 @@ type VB struct {
 	checkpointRetryBackoff time.Duration
 
 	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
-	// objects no live block references. Default false — opt-in until the
-	// cross-process "another process snapshots this volume mid-run" window
-	// (see ensureGCSnapshotSafe) has a durable answer.
+	// objects no live block references. Default false — opt-in, since a
+	// volume that is swept must satisfy the snapshot-ancestry rules in
+	// ensureGCSnapshotSafe and gcSnapshotMarkerMoved.
 	GCEnabled bool
 
-	// GCInterval controls how often the background chunk uploader also runs
-	// a GC sweep (default DefaultGCInterval). <= 0 disables the periodic
-	// sweep, but Close/DrainToBackend still run one on the way out. Ignored
-	// when GCEnabled is false.
+	// GCInterval controls how often the GC sweeper goroutine runs a sweep
+	// (default DefaultGCInterval). <= 0 disables the periodic sweep, but
+	// Close/DrainToBackend still run one on the way out. Ignored when
+	// GCEnabled is false.
 	GCInterval time.Duration
 
+	// GC sweeper control. The sweep runs on its own goroutine, NOT the chunk
+	// uploader's, so a drain that blocks inside DrainToBackendCtx (a slow or
+	// out-of-space backend retrying uploads) cannot starve the GC ticker —
+	// which is exactly when reclaim is needed most.
 	gcTicker *time.Ticker
+	gcStop   chan struct{}
+	gcDone   chan struct{}
 
 	// gcRefcount counts, per chunk ObjectID, how many live BlockLookup
 	// entries reference it (protected by BlocksToObject.mu). Zero marks a GC
@@ -370,6 +414,15 @@ type VB struct {
 	// so the next sweep retries instead of caching a transient failure.
 	gcSnapshotSafe    atomic.Bool
 	gcSnapshotChecked atomic.Bool
+
+	// gcMarkerBaseline is the volume's snapshot marker as it read at the
+	// moment gcSnapshotChecked was set, and gcMarkerMu guards it. Every sweep
+	// re-reads the marker and compares: a difference means some process
+	// snapshotted this volume since the ancestry scan, which the cached
+	// gcSnapshotSafe answer cannot see. Nil means the marker was absent, which
+	// is distinct from present-but-empty.
+	gcMarkerMu       sync.Mutex
+	gcMarkerBaseline []byte
 
 	// gcLatchedOff is set permanently, never cleared, the moment this VB
 	// instance does something that invalidates GC's invariants:
@@ -405,11 +458,11 @@ type BlockCache struct {
 }
 
 type Block struct {
+	Data   []byte `json:"Data"`
 	SeqNum uint64 `json:"SeqNum"`
 	Block  uint64 `json:"Block"`
 	Offset uint64 `json:"Offset"`
 	Len    uint64 `json:"Len"`
-	Data   []byte `json:"Data"`
 }
 
 type BlockOptimised struct {
@@ -430,10 +483,11 @@ type BlocksToObject struct {
 }
 
 type BlockLookup struct {
-	StartBlock   uint64
-	NumBlocks    uint16
-	ObjectID     uint64
-	ObjectOffset uint32
+	SeqNums []uint64
+
+	StartBlock uint64
+	ObjectID   uint64
+
 	// SeqNum is the chunk-write generation that produced this block's
 	// ciphertext on the backend. Drives nonce + AAD reconstruction on the
 	// decrypt path: the on-disk chunk carries no nonce, so the per-block
@@ -443,15 +497,12 @@ type BlockLookup struct {
 	//
 	// For NumBlocks == 1 this is the block's own SeqNum. For NumBlocks > 1
 	// it is StartBlock's SeqNum only, kept for wire-format compatibility;
-	// SeqNums below carries every block's own value, since blocks in a run
+	// SeqNums above carries every block's own value, since blocks in a run
 	// are not guaranteed to share one.
 	SeqNum uint64
 
-	// SeqNums holds one SeqNum per block in this entry's [StartBlock,
-	// StartBlock+NumBlocks) run, in order. Nil for single-block entries,
-	// where SeqNum alone is authoritative. Never serialized directly — the
-	// on-disk format stays one record per physical block (expandBlockLookup).
-	SeqNums []uint64
+	ObjectOffset uint32
+	NumBlocks    uint16
 }
 
 // end returns the exclusive upper bound of the block range this entry
@@ -969,6 +1020,8 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		//volumeName = backendConfig.(s3.S3Config).VolumeName
 		//volumeSize = backendConfig.(s3.S3Config).VolumeSize
 		backend = s3.New(backendConfig)
+	default:
+		return nil, fmt.Errorf("unsupported backend type %q", btype)
 	}
 	backend.SetLogger(log)
 
@@ -1085,6 +1138,8 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		BlockStore:    NewUnifiedBlockStore(config.BlockSize),
 		UseBlockStore: true,
 
+		Role: config.Role,
+
 		UseShardedWAL: false,
 		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
 
@@ -1128,6 +1183,18 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	// Start background chunk uploader (if interval > 0)
 	vb.StartChunkUploader()
+
+	// Start the GC sweeper on its own goroutine (if GC enabled and interval > 0)
+	vb.StartChunkGC()
+
+	// Emit the volume-open event. Every New() starts a chunk uploader, so
+	// every construction is a potential WRITER of this volume, not a reader --
+	// which is why the open is worth recording with process identity. Opens
+	// for one volume carrying two pids/roles mean two engines hold it.
+	telemetry.RecordVolumeOpen(context.Background(), vb.VolumeName, vb.Role)
+	vb.logger().Info("viperblock volume opened",
+		"volume", vb.VolumeName, "role", vb.Role, "pid", os.Getpid(),
+		"process", filepath.Base(os.Args[0]), "encrypted", vb.EncryptionEnabled)
 
 	return vb, nil
 }
@@ -1178,23 +1245,37 @@ func (vb *VB) StartWALSyncer() {
 		return
 	}
 
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running: starting a second goroutine would orphan the first,
+	// which would then keep syncing against fields the stopper has nil'd.
+	if vb.walSyncStop != nil {
+		return
+	}
+
 	vb.walSyncStop = make(chan struct{})
 	vb.walSyncDone = make(chan struct{})
 	vb.walSyncTicker = time.NewTicker(vb.WALSyncInterval)
 
+	// The goroutine closes over locals, never the VB fields: the stopper nils
+	// those, and a field read here would race that write however well the
+	// stopper itself is locked.
+	stop, done, ticker := vb.walSyncStop, vb.walSyncDone, vb.walSyncTicker
+
 	go func() {
-		defer close(vb.walSyncDone)
-		defer vb.walSyncTicker.Stop()
+		defer close(done)
+		defer ticker.Stop()
 
 		for {
 			select {
-			case <-vb.walSyncTicker.C:
+			case <-ticker.C:
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
 				} else {
 					vb.syncWALIfDirty()
 				}
-			case <-vb.walSyncStop:
+			case <-stop:
 				// Final sync before shutdown
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
@@ -1212,6 +1293,11 @@ func (vb *VB) StartWALSyncer() {
 // StopWALSyncer gracefully stops the background WAL sync goroutine.
 // It signals the goroutine to stop and waits for it to complete its final sync.
 func (vb *VB) StopWALSyncer() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller already stopped it and nil'd the
+	// fields while this one waited for the mutex. Either way it is stopped.
 	if vb.walSyncStop == nil {
 		return
 	}
@@ -1235,32 +1321,29 @@ func (vb *VB) StartChunkUploader() {
 		return
 	}
 
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running — see StartWALSyncer for why a second goroutine is not
+	// merely redundant but unsafe.
+	if vb.chunkUploadStop != nil {
+		return
+	}
+
 	vb.chunkUploadStop = make(chan struct{})
 	vb.chunkUploadDone = make(chan struct{})
 	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
 
-	// Chunk GC runs on its own cadence, decoupled from ChunkUploadInterval,
-	// so a short upload interval doesn't force GC's ancestry scan (see
-	// ensureGCSnapshotSafe) to run more often than necessary. gcTickerC
-	// stays nil (never fires below) when GC is off or GCInterval <= 0.
-	var gcTickerC <-chan time.Time
-	if vb.GCEnabled && vb.GCInterval > 0 {
-		vb.gcTicker = time.NewTicker(vb.GCInterval)
-		gcTickerC = vb.gcTicker.C
-	}
+	// Locals, not VB fields, for the same reason as the WAL syncer.
+	stop, done, ticker := vb.chunkUploadStop, vb.chunkUploadDone, vb.chunkUploadTicker
 
 	go func() {
-		defer close(vb.chunkUploadDone)
-		defer vb.chunkUploadTicker.Stop()
-		defer func() {
-			if vb.gcTicker != nil {
-				vb.gcTicker.Stop()
-			}
-		}()
+		defer close(done)
+		defer ticker.Stop()
 
 		for {
 			select {
-			case <-vb.chunkUploadTicker.C:
+			case <-ticker.C:
 				// DrainToBackendCtx itself latches/clears backendFull on
 				// ErrNoSpace/success, so a dropped error here is not
 				// silently lost — WriteAtCtx's up-front gate will start
@@ -1275,19 +1358,89 @@ func (vb *VB) StartChunkUploader() {
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: size-triggered DrainToBackend failed", "err", err)
 				}
-			case <-gcTickerC:
-				vb.runGCSweep(context.Background())
-			case <-vb.chunkUploadStop:
+			case <-stop:
 				return
 			}
 		}
 	}()
 
-	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval, "gcEnabled", vb.GCEnabled, "gcInterval", vb.GCInterval)
+	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval)
+}
+
+// StartChunkGC starts a background goroutine that periodically runs a chunk GC
+// sweep. It is deliberately a SEPARATE goroutine from the chunk uploader: a
+// sweep's drain-before-sweep and the uploader's drains serialise on drainMu,
+// but a drain that blocks (a slow or out-of-space backend retrying uploads)
+// only parks the goroutine it runs on. Sharing one select would let a stuck
+// uploader drain monopolise the goroutine and starve the GC ticker — exactly
+// when churn has made reclaim most urgent. Own goroutine, own cadence.
+func (vb *VB) StartChunkGC() {
+	if !vb.GCEnabled || vb.GCInterval <= 0 {
+		vb.logger().Debug("chunk GC sweeper disabled", "gcEnabled", vb.GCEnabled, "gcInterval", vb.GCInterval)
+		return
+	}
+
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running — see StartWALSyncer for why a second goroutine is unsafe.
+	if vb.gcStop != nil {
+		return
+	}
+
+	vb.gcStop = make(chan struct{})
+	vb.gcDone = make(chan struct{})
+	vb.gcTicker = time.NewTicker(vb.GCInterval)
+
+	// Locals, not VB fields, for the same reason as the WAL syncer.
+	stop, done, ticker := vb.gcStop, vb.gcDone, vb.gcTicker
+
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				vb.runGCSweep(context.Background())
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	vb.logger().Debug("chunk GC sweeper started", "interval", vb.GCInterval)
+}
+
+// StopChunkGC gracefully stops the background GC sweep goroutine, waiting for
+// any in-flight sweep to finish.
+func (vb *VB) StopChunkGC() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller already stopped it and nil'd the
+	// fields while this one waited for the mutex — see StopWALSyncer.
+	if vb.gcStop == nil {
+		return
+	}
+
+	close(vb.gcStop)
+	<-vb.gcDone
+
+	vb.gcStop = nil
+	vb.gcDone = nil
+	vb.gcTicker = nil
+
+	vb.logger().Debug("chunk GC sweeper stopped")
 }
 
 // StopChunkUploader stops the background chunk upload goroutine.
 func (vb *VB) StopChunkUploader() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller stopped it while this one waited
+	// for the mutex — see StopWALSyncer.
 	if vb.chunkUploadStop == nil {
 		return
 	}
@@ -1665,18 +1818,25 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	endOffset := offset + dataLen
 	endBlock := (endOffset - 1) / blockSize
 
-	// Reserve a contiguous SeqNum batch up-front. reserveSeqNum may call
-	// SaveState (which takes BlocksToObject.mu), so it must run before we
-	// acquire vb.Writes.mu below to keep the lock order consistent. We issue
-	// start+1..start+n to preserve the legacy "atomic.Add(1) post-increment"
-	// semantics (issued SeqNums are >= 1; SeqNum == 0 reads as uninitialised
-	// in BlockStore).
-	start, err := vb.reserveSeqNum(ctx, endBlock-startBlock+1)
-	if err != nil {
-		return err
-	}
-	nextSeqNum := start + 1
-
+	// Each block's read-modify-write cycle runs inside blockRMWLock(b), and
+	// its SeqNum is reserved INSIDE that section. Both matter:
+	//
+	//   - Atomicity. A sub-block write rebuilds the whole 4096-byte block from
+	//     the current contents plus its own range. If the read and the publish
+	//     are not serialized, two writes into one block both read generation N,
+	//     each splice their own range, and the loser's bytes vanish -- the
+	//     block ends up byte-exact with generation N over the losing range.
+	//
+	//   - Ordering. Reserving the SeqNum before taking the lock is not enough:
+	//     the writer holding the HIGHER SeqNum could acquire the lock second,
+	//     publish a block spliced onto an older base, and still win the
+	//     SeqNum comparison in WriteWithSeqNum/flush dedup. Reserving inside
+	//     the section makes SeqNum order identical to splice order, so the
+	//     last splice is always the winner and always carries every earlier
+	//     splice.
+	//
+	// Blocks are published one at a time rather than as one batch so a block's
+	// lock is never held while another block's backend read is in flight.
 	var writes []Block
 
 	for b := startBlock; b <= endBlock; b++ {
@@ -1700,42 +1860,14 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 			writeEnd = blockSize
 		}
 
-		// Read existing block if partial write, else skip
-		var blockData []byte
-		if writeStart > 0 || writeEnd < blockSize {
-			existing, err := vb.ReadAtCtx(ctx, b*blockSize, blockSize)
+		partial := writeStart > 0 || writeEnd < blockSize
 
-			if err != nil && !errors.Is(err, ErrZeroBlock) {
-				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
-			}
-			blockData = make([]byte, blockSize)
-			copy(blockData, existing)
-		} else {
-			blockData = make([]byte, blockSize) // full overwrite
+		blk, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
+			data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
+		if err != nil {
+			return err
 		}
-
-		// Copy the relevant data into block buffer
-		copy(blockData[writeStart:writeEnd], data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
-
-		writes = append(writes, Block{
-			SeqNum: nextSeqNum,
-			Block:  b,
-			Len:    blockSize,
-			Data:   blockData,
-		})
-		nextSeqNum++
-	}
-
-	// Thread-safe write into memory buffer
-	vb.Writes.mu.Lock()
-	vb.Writes.Blocks = append(vb.Writes.Blocks, writes...)
-	vb.Writes.mu.Unlock()
-
-	// Also update BlockStore if enabled (for O(1) read lookups)
-	if vb.UseBlockStore && vb.BlockStore != nil {
-		for _, block := range writes {
-			vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
-		}
+		writes = append(writes, blk)
 	}
 
 	vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
@@ -1750,6 +1882,90 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	}
 
 	return nil
+}
+
+// RMWShardCollisions returns the number of partial writes that found their
+// rmwLocks shard held by a DIFFERENT block. Harmless to correctness — the
+// two writes touch unrelated blocks — but a high rate means NumShards is too
+// small for the write concurrency in play.
+func (vb *VB) RMWShardCollisions() uint64 {
+	return vb.rmwShardCollisions.Load()
+}
+
+// RMWConflicts returns the number of partial writes that found another write
+// already rebuilding the same block. Non-zero means the guest workload
+// produces same-block write concurrency, which is the precondition for the
+// lost-update class that per-block RMW serialization removes.
+func (vb *VB) RMWConflicts() uint64 {
+	return vb.rmwConflicts.Load()
+}
+
+// blockRMWLock returns the mutex serializing read-modify-write cycles for a
+// block. Sharded by block number so unrelated blocks never contend.
+func (vb *VB) blockRMWLock(block uint64) *sync.Mutex {
+	return &vb.rmwLocks[block&ShardMask]
+}
+
+// writeOneBlockLocked performs one block's whole read-splice-publish cycle
+// under that block's RMW lock, reserving the SeqNum inside the section so
+// SeqNum order matches splice order. patch is the caller's bytes for
+// [writeStart, writeEnd) of this block. Returns the published Block.
+func (vb *VB) writeOneBlockLocked(ctx context.Context, b, blockSize uint64, partial bool, writeStart, writeEnd uint64, patch []byte) (Block, error) {
+	lk := vb.blockRMWLock(b)
+
+	// Contention on a partial write is the condition that used to silently
+	// drop an update; count it so the corruption class is observable rather
+	// than inferred after the fact.
+	shard := b & ShardMask
+	if partial && !lk.TryLock() {
+		// Only a holder on the SAME block is the lost-update precondition; a
+		// different block means the two merely share one of NumShards locks.
+		if vb.rmwHolders[shard].Load() == b+1 {
+			vb.rmwConflicts.Add(1)
+			telemetry.RecordRMWConflict(ctx, vb.VolumeName)
+			vb.logger().DebugContext(ctx, "read-modify-write conflict: block already being rebuilt by another write",
+				"volume", vb.VolumeName, "block", b, "writeStart", writeStart, "writeEnd", writeEnd)
+		} else {
+			vb.rmwShardCollisions.Add(1)
+		}
+		lk.Lock()
+	} else if !partial {
+		lk.Lock()
+	}
+	vb.rmwHolders[shard].Store(b + 1)
+	defer func() {
+		vb.rmwHolders[shard].Store(0)
+		lk.Unlock()
+	}()
+
+	blockData := make([]byte, blockSize)
+	if partial {
+		existing, err := vb.ReadAtCtx(ctx, b*blockSize, blockSize)
+		if err != nil && !errors.Is(err, ErrZeroBlock) {
+			return Block{}, fmt.Errorf("failed to read block %d for RMW: %w", b, err)
+		}
+		copy(blockData, existing)
+	}
+	copy(blockData[writeStart:writeEnd], patch)
+
+	// Reserved inside the section -- see WriteAtCtx for why.
+	start, err := vb.reserveSeqNum(ctx, 1)
+	if err != nil {
+		return Block{}, err
+	}
+	seqNum := start + 1
+
+	blk := Block{SeqNum: seqNum, Block: b, Len: blockSize, Data: blockData}
+
+	vb.Writes.mu.Lock()
+	vb.Writes.Blocks = append(vb.Writes.Blocks, blk)
+	vb.Writes.mu.Unlock()
+
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		vb.BlockStore.WriteWithSeqNum(b, blockData, seqNum)
+	}
+
+	return blk, nil
 }
 
 func (vb *VB) Write(block uint64, data []byte) (err error) {
@@ -1861,11 +2077,19 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	defer func() {
 		if err != nil {
 			if errors.Is(err, ErrNoSpace) {
-				vb.backendFull.Store(true)
+				// Log only the false→true edge (Swap returns the prior value) so a
+				// persistently full backend does not repeat the line on every drain
+				// attempt. This is the signal that guest writes are now failing fast.
+				if !vb.backendFull.Swap(true) {
+					vb.logger().Warn("backend out of space: latching writes off until a drain succeeds", "err", err)
+				}
 			}
 			return
 		}
-		vb.backendFull.Store(false)
+		// A clean drain clears the latch; log only the true→false recovery edge.
+		if vb.backendFull.Swap(false) {
+			vb.logger().Info("backend space recovered: drain succeeded, writes re-enabled")
+		}
 	}()
 
 	if err = vb.Flush(); err != nil {
@@ -3387,8 +3611,9 @@ const snapPrefix = "snap-"
 // Cached for the process lifetime once a scan completes, safe or not — the
 // guard never loosens once a snapshot exists. A scan error is not cached.
 //
-// Misses a snapshot created by another process after the scan; that
-// cross-process gap is why GCEnabled defaults to false.
+// Only answers for snapshots that existed at scan time. Snapshots created
+// afterwards, including by another process, are caught per sweep by
+// gcSnapshotMarkerMoved.
 func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 	if vb.gcLatchedOff.Load() {
 		return false
@@ -3397,11 +3622,25 @@ func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 		return vb.gcSnapshotSafe.Load()
 	}
 
+	// Read the marker BEFORE the scan, never after. A snapshot landing
+	// between the two reads is then either visible to the scan or a marker
+	// change against this baseline; taking the baseline afterwards would let
+	// that snapshot fall through both checks.
+	baseline, markerErr := vb.readSnapshotMarker(ctx)
+	if markerErr != nil {
+		vb.logger().Warn("chunk GC: snapshot-marker baseline read failed, sweep skipped this round", "err", markerErr)
+		return false
+	}
+
 	safe, err := vb.scanForOwnSnapshots(ctx)
 	if err != nil {
 		vb.logger().Warn("chunk GC: snapshot-ancestry scan failed, sweep skipped this round", "err", err)
 		return false
 	}
+
+	vb.gcMarkerMu.Lock()
+	vb.gcMarkerBaseline = baseline
+	vb.gcMarkerMu.Unlock()
 
 	vb.gcSnapshotSafe.Store(safe)
 	vb.gcSnapshotChecked.Store(true)
@@ -3451,6 +3690,77 @@ func (vb *VB) scanForOwnSnapshots(ctx context.Context) (safe bool, err error) {
 	}
 
 	return true, nil
+}
+
+// snapshotMarker is the payload of a volume's snapshots.marker object: a
+// change token naming the most recent snapshot taken of that volume. Readers
+// compare the marshalled bytes for equality and never interpret the fields,
+// which exist so an operator inspecting the key can tell what moved it.
+type snapshotMarker struct {
+	SnapshotID string    `json:"SnapshotID"`
+	CreatedAt  time.Time `json:"CreatedAt"`
+}
+
+// writeSnapshotMarker publishes snapshotID as this volume's most recent
+// snapshot, under the volume's own prefix so a reader finds it with one GET
+// instead of a bucket-wide listing.
+//
+// Callers must write the marker BEFORE reading any state the snapshot will
+// freeze. That ordering is what makes the marker sound across processes: a
+// sweeper reads it only after its own live checkpoint is durable, so a
+// snapshot that froze an older map necessarily wrote the marker first and the
+// sweeper sees the change.
+func (vb *VB) writeSnapshotMarker(ctx context.Context, snapshotID string) error {
+	payload, err := json.Marshal(snapshotMarker{SnapshotID: snapshotID, CreatedAt: time.Now()})
+	if err != nil {
+		return fmt.Errorf("marshal snapshot marker: %w", err)
+	}
+
+	headers := []byte{}
+	if err := vb.Backend.WriteCtx(ctx, types.FileTypeSnapshotMarker, 0, &headers, &payload); err != nil {
+		return fmt.Errorf("write snapshot marker: %w", err)
+	}
+	return nil
+}
+
+// readSnapshotMarker returns the volume's raw snapshot-marker bytes, or nil
+// when no snapshot has ever been taken of it. Absence is a valid baseline
+// that a first snapshot moves; only a genuine read failure is an error.
+func (vb *VB) readSnapshotMarker(ctx context.Context) ([]byte, error) {
+	data, err := vb.Backend.ReadCtx(ctx, types.FileTypeSnapshotMarker, 0, 0, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// gcSnapshotMarkerMoved reports whether any process has snapshotted this
+// volume since ensureGCSnapshotSafe captured its baseline — the case the
+// cached ancestry answer and CreateSnapshot's in-process latch both miss.
+// Once moved, GC latches off permanently for this VB, matching the in-process
+// latch: a snapshot pins chunks for as long as it exists.
+//
+// A read failure returns true without latching, so the sweep is skipped and
+// the next one retries rather than treating a transient error as "no
+// snapshot".
+func (vb *VB) gcSnapshotMarkerMoved(ctx context.Context) bool {
+	current, err := vb.readSnapshotMarker(ctx)
+	if err != nil {
+		vb.logger().Warn("chunk GC: snapshot-marker read failed, sweep skipped this round", "err", err)
+		return true
+	}
+
+	vb.gcMarkerMu.Lock()
+	moved := !bytes.Equal(current, vb.gcMarkerBaseline)
+	vb.gcMarkerMu.Unlock()
+
+	if moved && vb.gcLatchedOff.CompareAndSwap(false, true) {
+		vb.logger().Warn("chunk GC: disabled permanently, another process snapshotted this volume", "volume", vb.VolumeName)
+	}
+	return moved
 }
 
 // chunkKeyPattern extracts the ObjectID from a chunk key of the form
@@ -3518,6 +3828,11 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		return
 	}
 	if !vb.ensureGCSnapshotSafe(ctx) {
+		// Info rather than Debug because this is the silent-forever case: after
+		// the first scan ensureGCSnapshotSafe answers from its cache and logs
+		// nothing, so a volume GC has declined to touch would otherwise look
+		// exactly like a volume GC never visited.
+		vb.logger().Info("chunk GC: sweep skipped, snapshot-safety check declined", "volume", vb.VolumeName)
 		return
 	}
 
@@ -3538,13 +3853,28 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	}
 	vb.BlocksToObject.mu.Unlock()
 
+	// Last check before anything is deleted, and deliberately here rather than
+	// at the top of the sweep: the caller has already made this sweep's live
+	// checkpoint durable, so any snapshot that froze an older map than that
+	// checkpoint must have written its marker before this read. A snapshot
+	// that froze the same or a newer map cannot reference these candidates at
+	// all, since a chunk absent from the live map never returns to it.
+	if vb.gcSnapshotMarkerMoved(ctx) {
+		vb.logger().Info("chunk GC: sweep abandoned, another process snapshotted this volume",
+			"volume", vb.VolumeName, "candidates", len(candidates))
+		return
+	}
+
 	swept := vb.deleteChunkObjects(ctx, candidates)
 
-	if swept > 0 {
-		vb.logger().Info("chunk GC: sweep complete", "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
-	} else {
-		vb.logger().Debug("chunk GC: sweep found nothing to reclaim", "floor", floor, "watermark", watermark)
-	}
+	// One line per sweep at Info, whatever the outcome. Reclaiming nothing is
+	// the normal, healthy case and has to be as visible as reclaiming
+	// something: at Debug it isn't, and a correctly-idle GC then reads
+	// identically to a GC that never ran — which is the wrong property for the
+	// component whose job is deleting data. At DefaultGCInterval this costs
+	// twelve lines an hour per volume.
+	vb.logger().Info("chunk GC: sweep complete",
+		"volume", vb.VolumeName, "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
 }
 
 // deleteChunkObjects issues a DeleteObject call per chunk ObjectID and
@@ -4113,7 +4443,10 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	stride := vb.blockStride()
 	vb.BlocksToObject.mu.RUnlock()
 
-	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
+	// Log the resolved scalars, not the BlockLookup struct: boxing a struct
+	// into slog's any forces a heap alloc at the call site on every block
+	// lookup, even at Info where this Debug line is dropped.
+	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "objectID", blockLookup.ObjectID, "found", ok)
 
 	if ok {
 		return blockLookup.ObjectID, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
@@ -4888,6 +5221,13 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 				return nil, err
 			}
 		} else {
+			// openChunkRun length-checks the encrypted path; the cleartext
+			// path must not be weaker. A short body here would leave the tail
+			// of data[start:end] zero-filled and then get cached as valid.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return nil, fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
@@ -4953,6 +5293,13 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 
 	// Compute offset within the first block
 	innerOffset := offset % blockSize
+
+	// read() always returns a full-length buffer when err is nil or ErrZeroBlock
+	// (it only returns nil data alongside a genuine error), so this guard is
+	// belt-and-suspenders — it encodes that invariant rather than dereferencing blind.
+	if fullData == nil {
+		return nil, err
+	}
 	return fullData[innerOffset : innerOffset+length], err
 }
 
@@ -4960,6 +5307,7 @@ func (vb *VB) Close() error {
 	vb.logger().Info("VB Close, flushing block state to disk")
 
 	// Stop background goroutines before flushing
+	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
 
@@ -5418,6 +5766,12 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 				return err
 			}
 		} else {
+			// See vb.read: the cleartext path needs the same length check the
+			// encrypted path gets from openChunkRun.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
@@ -5526,6 +5880,12 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 				return fmt.Errorf("base chunk decrypt source %s: %w", sourceVolume, err)
 			}
 		} else {
+			// See vb.read: the cleartext path needs the same length check the
+			// encrypted path gets from openChunkRun.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return fmt.Errorf("%w: base source %s chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, sourceVolume, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
