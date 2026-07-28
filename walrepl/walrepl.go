@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -174,6 +175,27 @@ func (s *ReplicaServer) serveOnePrimary(connection net.Conn) error {
 			return err
 		}
 	}
+}
+
+// ListReplicaWALFiles returns the replica WAL files this package wrote for
+// volumeName under directoryPath, sorted oldest-first by the unixnano
+// timestamp embedded in the file name. This is the promotion entry point:
+// each returned path is a VALID WAL file (handshake header + records) that
+// viperblock's recovery can replay -- install them into a fresh volume
+// base directory with viperblock.InstallRecoveryWALFiles and run the
+// normal production open sequence (fork F2 promotion slice, 2026-07-28).
+func ListReplicaWALFiles(directoryPath, volumeName string) ([]string, error) {
+	pattern := filepath.Join(directoryPath,
+		sanitizeFileNameComponent(volumeName)+".replica.*.wal")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	// Timestamps are fixed-width (19-digit unixnano until year 2262), so
+	// the lexical sort Glob already applies IS chronological; keep an
+	// explicit sort for clarity and future-proofing.
+	sort.Strings(matches)
+	return matches, nil
 }
 
 func sanitizeFileNameComponent(name string) string {
