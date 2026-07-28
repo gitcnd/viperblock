@@ -29,8 +29,13 @@ go_build_nbd:
 	@echo -e "\n....Building NBD plugin"
 	GOFIPS140=v1.0.0 go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
 
-# Preflight — runs the same checks as GitHub Actions (lint + vuln + tests).
-# Use this before committing to catch CI failures locally.
+# Preflight — the pre-commit gate: lint + vuln + the unit and race tiers.
+#
+# The integration tier is deliberately NOT here. Its build tag is additive, so
+# it re-runs every unit test on top of its own, which roughly doubled preflight
+# for no extra signal locally. CI runs it as its own parallel job, so it is
+# still gated before merge — run `make test-integration` directly when a change
+# touches the multi-engine or network-failure paths it covers.
 preflight:
 	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
 	@echo -e "\n ✅ Preflight passed — safe to commit."
@@ -47,10 +52,25 @@ test-cover:
 	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
 
-# Run unit tests with race detector
+# Integration tier: tests that stand up a second VB engine over one volume, or
+# drive real network-failure behaviour against a dead host. They are gated
+# behind the `integration` build tag so the unit targets above stay inside
+# their 120s budget; the tag is additive, so this target runs the unit tests
+# too and needs a budget covering both.
+test-integration:
+	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
+	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 600s ./viperblock/... $(_RACEQ)
+
+# Run unit tests with race detector.
+#
+# The budget is not the unit tier's 120s: the race detector costs this suite
+# roughly 2.5x, and the s3 matrix variants stand up a predastore cluster per
+# subtest. The whole tier measures ~280s on a dev box, so 300s sat close enough
+# to the wall time that a loaded machine tipped it into a timeout panic that
+# looked like a hang.
 test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
-	$(_Q)LOG_IGNORE=1 go test -race -timeout 300s ./viperblock/... $(_RACEQ)
+	$(_Q)LOG_IGNORE=1 go test -race -timeout 900s ./viperblock/... $(_RACEQ)
 
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
@@ -84,5 +104,12 @@ govulncheck:
 	$(_Q)go tool govulncheck ./...
 	@echo "  govulncheck ok"
 
-.PHONY: build go_build go_build_nbd preflight test test-cover test-race diff-coverage bench run clean \
-	lint fix govulncheck
+# NilAway — advisory nil-panic analysis. Not in preflight: it has a known
+# false-positive rate, so findings are triaged by hand rather than gating commits.
+nilaway:
+	@echo "Running nilaway..."
+	$(_Q)go tool nilaway -include-pkgs=github.com/mulgadc/viperblock -exclude-test-files ./...
+	@echo "  nilaway ok"
+
+.PHONY: build go_build go_build_nbd preflight test test-cover test-race test-integration diff-coverage bench run clean \
+	lint fix govulncheck nilaway

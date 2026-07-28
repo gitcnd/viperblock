@@ -1,13 +1,16 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -938,4 +941,469 @@ func TestChunkGC_ConcurrentDrainAndSweepPreserveLiveChunks(t *testing.T) {
 		require.NoErrorf(t, err, "reading writer %d range", w)
 		assert.Equalf(t, lastWritten[w], got, "writer %d: block range did not read back its last write -- a live chunk was superseded incorrectly or deleted", w)
 	}
+}
+
+// openSnapshotOnlyVB models the VB spinifex's daemon builds to snapshot a
+// volume another process is serving: same backend prefix, its own local WAL
+// directory, and no WAL opened, so ownsWAL() is false and CreateSnapshot
+// freezes the map it loaded rather than draining one it doesn't own.
+func openSnapshotOnlyVB(t *testing.T, backendRoot, localRoot, volumeName string) *VB {
+	t.Helper()
+
+	backendConfig := file.FileConfig{
+		VolumeName: volumeName,
+		VolumeSize: volumeSize,
+		BaseDir:    backendRoot,
+	}
+
+	vbconfig := VB{
+		VolumeName:      volumeName,
+		VolumeSize:      volumeSize,
+		BaseDir:         filepath.Join(localRoot, "viperblock"),
+		WALSyncInterval: -1,
+		GCInterval:      -1,
+		Cache: Cache{
+			Config: CacheConfig{Size: 0},
+		},
+	}
+
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
+
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
+
+	return vb
+}
+
+// Test 16: a snapshot taken by another process, after the sweeping engine has
+// already cached its ancestry answer, must still stop that engine sweeping.
+// This is the case gcLatchedOff (in-process) and the cached scan both miss,
+// and it is spinifex's primary snapshot path: nbdkit serves and sweeps the
+// attached volume while the daemon snapshots it for CreateImage.
+func TestChunkGC_CrossProcessSnapshotLatchesSweeperOff(t *testing.T) {
+	backendRoot := t.TempDir()
+	volumeName := "vol-xproc-snap"
+	ctx := context.Background()
+
+	server := newGCTestVB(t, backendRoot, volumeName, true)
+
+	original := randomBlockData(4)
+	writeAndChunk(t, server, 0, original)
+	frozenChunkID := server.ObjectNum.Load() - 1
+
+	// Sweep once with no snapshot in existence: this is what caches the
+	// "safe" ancestry answer and the marker baseline for the VB's lifetime.
+	server.runGCSweep(ctx)
+	require.False(t, server.gcLatchedOff.Load(), "a volume with no snapshots must not latch off")
+	assertChunkPresent(t, server.Backend, volumeName, frozenChunkID)
+
+	// Another process snapshots the same volume. The serving engine above is
+	// never told. Persist state first, since the second VB opens the volume
+	// off the backend the way the daemon does.
+	require.NoError(t, server.SaveState())
+
+	snapshotID := "snap-" + volumeName
+	snapper := openSnapshotOnlyVB(t, backendRoot, t.TempDir(), volumeName)
+	_, err := snapper.CreateSnapshot(snapshotID)
+	require.NoError(t, err)
+
+	// The cached ancestry answer is now stale and still says "safe" -- it was
+	// computed before the snapshot existed and is never recomputed. Asserted
+	// explicitly so it is clear the marker check below is the only thing
+	// standing between this sweep and deleting the snapshot's chunks.
+	require.True(t, server.ensureGCSnapshotSafe(ctx), "precondition: the cached ancestry answer must still be the pre-snapshot one")
+
+	// The serving engine keeps writing, superseding every chunk the snapshot
+	// froze, then sweeps on that stale answer.
+	overwrite := randomBlockData(4)
+	writeAndChunk(t, server, 0, overwrite)
+	server.runGCSweep(ctx)
+	assertClosure(t, server)
+
+	assert.True(t, server.gcLatchedOff.Load(), "sweeper must latch off once the marker moves")
+	assertChunkPresent(t, server.Backend, volumeName, frozenChunkID)
+
+	// The snapshot restores byte-exact: the whole point of the pin.
+	clone := cloneGCTestVB(t, server, snapshotID, "vol-xproc-clone", false)
+	for i := range uint64(4) {
+		readData, err := clone.ReadAt(i*uint64(clone.BlockSize), uint64(clone.BlockSize))
+		require.NoError(t, err)
+		expected := original[i*uint64(DefaultBlockSize) : (i+1)*uint64(DefaultBlockSize)]
+		assert.Equal(t, expected, readData, "block %d mismatch reading through the cross-process snapshot", i)
+	}
+
+	// And the serving volume still reads its own latest data.
+	readBack, err := server.ReadAt(0, uint64(len(overwrite)))
+	require.NoError(t, err)
+	assert.Equal(t, overwrite, readBack)
+}
+
+// failingMarkerBackend wraps a real file backend and can be told to fail the
+// snapshot marker's write or read independently, for Tests 17 and 18.
+type failingMarkerBackend struct {
+	*file.Backend
+
+	failMarkerWrite atomic.Bool
+	failMarkerRead  atomic.Bool
+}
+
+var _ types.Backend = (*failingMarkerBackend)(nil)
+
+func (b *failingMarkerBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeSnapshotMarker && b.failMarkerWrite.Load() {
+		return errors.New("injected: snapshot marker write failure")
+	}
+	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
+}
+
+func (b *failingMarkerBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeSnapshotMarker && b.failMarkerRead.Load() {
+		return nil, errors.New("injected: snapshot marker read failure")
+	}
+	return b.Backend.ReadCtx(ctx, fileType, objectId, offset, length)
+}
+
+// Test 17: a snapshot whose marker doesn't land must fail. Creating it anyway
+// would leave a snapshot no sweeping engine can observe, whose chunks can be
+// reclaimed underneath it.
+func TestChunkGC_SnapshotMarkerWriteFailureFailsSnapshot(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-write-fault"
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	fb, ok := vb.Backend.(*file.Backend)
+	require.True(t, ok)
+	wrapped := &failingMarkerBackend{Backend: fb}
+	vb.Backend = wrapped
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+
+	wrapped.failMarkerWrite.Store(true)
+	snapshotID := "snap-" + volumeName
+	_, err := vb.CreateSnapshot(snapshotID)
+	require.Error(t, err, "CreateSnapshot must fail when the snapshot marker cannot be published")
+
+	// Nothing a reader would accept as a snapshot may be left behind.
+	_, cfgErr := vb.Backend.ReadFrom(snapshotID, types.FileTypeConfig, 0, 0, 0)
+	require.Error(t, cfgErr)
+	assert.True(t, os.IsNotExist(cfgErr), "expected no snapshot config after a failed marker write, got %v", cfgErr)
+}
+
+// Test 18: a marker the sweeper cannot read is not evidence of "no snapshot".
+// The sweep must skip and retry, not delete.
+func TestChunkGC_SnapshotMarkerReadFailureSkipsSweep(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-read-fault"
+	ctx := context.Background()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	fb, ok := vb.Backend.(*file.Backend)
+	require.True(t, ok)
+	wrapped := &failingMarkerBackend{Backend: fb}
+	vb.Backend = wrapped
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	garbageChunkID := vb.ObjectNum.Load() - 1
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+
+	wrapped.failMarkerRead.Store(true)
+	vb.runGCSweep(ctx)
+	assertClosure(t, vb)
+	assertChunkPresent(t, vb.Backend, volumeName, garbageChunkID)
+	assert.False(t, vb.gcLatchedOff.Load(), "a transient marker read failure must not latch GC off permanently")
+
+	// Clearing the fault lets the same chunk be reclaimed, proving the failure
+	// only deferred the sweep.
+	wrapped.failMarkerRead.Store(false)
+	vb.runGCSweep(ctx)
+	assertClosure(t, vb)
+	assertChunkGone(t, vb.Backend, volumeName, garbageChunkID)
+}
+
+// Test 19: a marker that never moves must not latch GC off. Guards the
+// opposite failure to Test 16 -- a marker check that fails closed on every
+// sweep would silently disable reclaim for every volume.
+func TestChunkGC_UnchangedMarkerStillSweeps(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-steady"
+	ctx := context.Background()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	for pass := range 3 {
+		writeAndChunk(t, vb, 0, randomBlockData(4))
+		garbageChunkID := vb.ObjectNum.Load() - 1
+		writeAndChunk(t, vb, 0, randomBlockData(4))
+
+		vb.runGCSweep(ctx)
+		assertClosure(t, vb)
+		assertChunkGone(t, vb.Backend, volumeName, garbageChunkID)
+		assert.Falsef(t, vb.gcLatchedOff.Load(), "pass %d: an unmoved marker must not latch GC off", pass)
+	}
+}
+
+// newGCLogCaptureVB builds a GC-enabled VB whose logger writes to buf at Info
+// level. The level is the point: anything these tests assert on must survive a
+// handler that drops Debug, which is how the nbdkit plugin runs in production.
+func newGCLogCaptureVB(t *testing.T, root, volumeName string, buf *bytes.Buffer) *VB {
+	t.Helper()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+	vb.log = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	return vb
+}
+
+// A sweep that reclaims nothing is the normal case for a healthy volume, and
+// it has to be visible at the level production actually runs at. Otherwise a
+// correctly-idle GC is indistinguishable from a GC that never ran, which is
+// what forced the env13 verification to count objects in the volume prefix
+// instead of reading the log.
+func TestChunkGC_IdleSweepIsVisibleAtInfoLevel(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	vb := newGCLogCaptureVB(t, root, "vol-idle-sweep-log", &buf)
+
+	// Live data only: every chunk is still referenced, so the sweep runs to
+	// completion and finds nothing to reclaim.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	buf.Reset()
+	vb.runGCSweep(ctx)
+
+	logged := buf.String()
+	require.Contains(t, logged, "chunk GC: sweep complete",
+		"a sweep that reclaimed nothing must still report at Info; at Debug it is invisible in production")
+	assert.Contains(t, logged, "swept=0", "the sweep outcome must say how much it reclaimed, including none")
+	assert.Contains(t, logged, "candidates=0")
+	assert.Contains(t, logged, "volume=vol-idle-sweep-log", "the line must name the volume it swept")
+}
+
+// The snapshot-declined path is the silent-forever one: ensureGCSnapshotSafe
+// warns on its first scan, then answers from cache and says nothing, so every
+// later sweep on a pinned volume must report for itself.
+func TestChunkGC_DeclinedSweepIsVisibleOnEveryPass(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	vb := newGCLogCaptureVB(t, root, "vol-declined-sweep-log", &buf)
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	_, err := vb.CreateSnapshot("snap-vol-declined-sweep-log")
+	require.NoError(t, err)
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Two passes: the second is the one that matters, since by then the
+	// snapshot-safety answer is cached and logs nothing of its own.
+	for pass := range 2 {
+		buf.Reset()
+		vb.runGCSweep(ctx)
+		assert.Contains(t, buf.String(), "chunk GC: sweep skipped",
+			"pass %d: a declined sweep must say so every time, not just on the first scan", pass+1)
+	}
+}
+
+// TestChunkGC_TickerDispatchesSweep exercises the deployed dispatch path: the
+// background chunk-uploader goroutine's select loop, where the GC ticker case
+// lives alongside the drain cases. The plugin never calls runGCSweep directly —
+// it relies on this ticker firing — so a sweep that works when called by hand
+// (every other test here) proves nothing about whether it ever runs in prod.
+func TestChunkGC_TickerDispatchesSweep(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	safeBuf := &syncBuffer{buf: &buf}
+
+	backendConfig := file.FileConfig{VolumeName: "vol-ticker-gc", VolumeSize: volumeSize, BaseDir: root}
+	vbconfig := VB{
+		VolumeName: "vol-ticker-gc",
+		VolumeSize: volumeSize,
+		BaseDir:    filepath.Join(root, "viperblock"),
+		// Positive short intervals: mirror the plugin (which defaults these to
+		// 200ms / 30s / 5m) but fast enough for a test to see several ticks.
+		WALSyncInterval:     10 * time.Millisecond,
+		ChunkUploadInterval: 25 * time.Millisecond,
+		GCEnabled:           true,
+		GCInterval:          50 * time.Millisecond,
+		Logger:              slog.New(slog.NewTextHandler(safeBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Cache:               Cache{Config: CacheConfig{Size: 0}},
+	}
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		vb.StopChunkGC()
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	// Create garbage: write the same blocks twice so the first chunk is
+	// superseded and becomes a GC candidate.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Wait for the GC ticker (50ms) to fire several times.
+	require.Eventually(t, func() bool {
+		return strings.Contains(safeBuf.String(), "chunk GC: sweep")
+	}, 5*time.Second, 50*time.Millisecond,
+		"the GC ticker must dispatch runGCSweep on its own; no chunk GC line appeared in 5s of ticks")
+}
+
+// slowChunkBackend wraps a Backend and makes every chunk upload slow but still
+// progressing: it sleeps, then delegates and returns, releasing drainMu each
+// time. This is the env13 condition — sustained overwrite churn keeps the
+// chunk uploader ~continuously inside DrainToBackendCtx — WITHOUT the
+// unrecoverable, backend-full case (where a drain can never complete and no
+// amount of GC scheduling helps). blocked counts chunk writes in flight so the
+// test can confirm drains really are happening while GC sweeps.
+type slowChunkBackend struct {
+	types.Backend
+
+	delay   time.Duration
+	blocked atomic.Int32 // chunk writes currently sleeping
+}
+
+func (s *slowChunkBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeChunk {
+		s.blocked.Add(1)
+		defer s.blocked.Add(-1)
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
+}
+
+// TestChunkGC_SweepsUnderSustainedSlowDrains is the regression guard for the
+// production bug (mulga-99rr5): the GC ticker used to share the chunk-uploader
+// goroutine's select with the drain cases, so under sustained churn — where
+// that goroutine sits almost permanently inside a slow DrainToBackendCtx — the
+// GC tick lost the select race every time and never fired. With GC on its own
+// goroutine, a slow-but-progressing drain no longer starves it: the sweep runs
+// even while the uploader is continuously draining. If GC is ever folded back
+// into the uploader select, the sweep line stops appearing and this fails.
+func TestChunkGC_SweepsUnderSustainedSlowDrains(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	safeBuf := &syncBuffer{buf: &buf}
+
+	backendConfig := file.FileConfig{VolumeName: "vol-slow-gc", VolumeSize: volumeSize, BaseDir: root}
+	vbconfig := VB{
+		VolumeName: "vol-slow-gc",
+		VolumeSize: volumeSize,
+		BaseDir:    filepath.Join(root, "viperblock"),
+		// Background loops stay off at New(): we wrap the backend and start the
+		// uploader + GC by hand so the slow backend is in place before they run.
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCEnabled:           true,
+		GCInterval:          30 * time.Millisecond,
+		Logger:              slog.New(slog.NewTextHandler(safeBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Cache:               Cache{Config: CacheConfig{Size: 0}},
+	}
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	// Make GC candidates with the fast, unwrapped backend: same blocks written
+	// twice so the first chunk is superseded and becomes sweepable.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Wrap the backend so every subsequent chunk upload takes 60ms — slow enough
+	// that continuous churn keeps the uploader almost permanently inside a drain.
+	sb := &slowChunkBackend{Backend: vb.Backend, delay: 60 * time.Millisecond}
+	vb.Backend = sb
+
+	// Drive continuous writes so pendingBytes stays high and the uploader keeps
+	// re-entering DrainToBackendCtx back to back.
+	writerStop := make(chan struct{})
+	stopWriter := sync.OnceFunc(func() { close(writerStop) })
+	go func() {
+		blk := uint64(0)
+		for {
+			select {
+			case <-writerStop:
+				return
+			default:
+				_ = vb.Write(blk%64, randomBlockData(1))
+				_ = vb.Flush()
+				blk++
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Start the uploader and the (now independent) GC sweeper.
+	vb.ChunkUploadInterval = 20 * time.Millisecond
+	vb.StartChunkUploader()
+	vb.StartChunkGC()
+
+	// Teardown runs LIFO: stop the writer, then the goroutines, then remove files.
+	t.Cleanup(func() { assert.NoError(t, vb.RemoveLocalFiles()) })
+	t.Cleanup(vb.StopChunkUploader)
+	t.Cleanup(vb.StopChunkGC)
+	t.Cleanup(stopWriter)
+
+	// Confirm the uploader really is spending time inside slow drains — otherwise
+	// the assertion below would pass vacuously against an idle backend.
+	require.Eventually(t, func() bool { return sb.blocked.Load() > 0 }, 3*time.Second, 10*time.Millisecond,
+		"the chunk uploader never entered a slow drain")
+
+	// The GC sweep must fire on its own goroutine despite the uploader being
+	// continuously busy draining. On the pre-fix shared-goroutine code this line
+	// never appears under this load.
+	require.Eventually(t, func() bool {
+		return strings.Contains(safeBuf.String(), "chunk GC: sweep")
+	}, 8*time.Second, 50*time.Millisecond,
+		"GC never swept under sustained slow drains — a busy uploader must not starve the independent GC goroutine")
+}
+
+// syncBuffer serialises writes from the background goroutine with test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *syncBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
 }
