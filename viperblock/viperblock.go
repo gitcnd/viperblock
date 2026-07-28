@@ -337,6 +337,16 @@ type VB struct {
 	// (see ensureGCSnapshotSafe) has a durable answer.
 	GCEnabled bool
 
+	// Replicator, when non-nil, receives every WAL record (in WAL order,
+	// from inside the WAL write lock) and participates in the flush
+	// barrier: Flush() returns only after the replica has acknowledged
+	// durability of everything appended (fork F2: synchronous peer WAL
+	// replication, human-acked 2026-07-28). Set post-construction, before
+	// serving IO. A broken replica FAILS the barrier -- degraded-mode
+	// policy (detach/alarm/re-pair) is a later slice, tracked in the
+	// spinifex project plan.
+	Replicator WALReplicator
+
 	// SyncOnFlush makes Flush() a DURABLE barrier: after draining the
 	// memory buffer into the WAL, the active WAL file is fsynced before
 	// Flush returns. Without it, the barrier every guest fsync maps onto
@@ -1852,6 +1862,11 @@ func (vb *VB) Flush() (err error) {
 	vb.Writes.mu.Lock()
 	defer vb.Writes.mu.Unlock()
 	if vb.UseShardedWAL {
+		if vb.Replicator != nil {
+			// Sharded WAL has no single record order to replicate; F2
+			// replication is legacy-WAL only in this slice.
+			return fmt.Errorf("WAL replication is not supported with the sharded WAL")
+		}
 		if err := vb.flushLockedSharded(); err != nil {
 			return err
 		}
@@ -1863,9 +1878,29 @@ func (vb *VB) Flush() (err error) {
 	if vb.SyncOnFlush {
 		// Durable barrier (gate P1.4): the records just written must be on
 		// stable storage before the guest's FLUSH is acknowledged.
-		return vb.syncWALForBarrier()
+		if err := vb.syncWALForBarrier(); err != nil {
+			return err
+		}
+	}
+	if vb.Replicator != nil {
+		// Replication half of the barrier (fork F2): acknowledged means
+		// durable on the peer too.
+		if err := vb.Replicator.Barrier(); err != nil {
+			return fmt.Errorf("replication barrier: %w", err)
+		}
 	}
 	return nil
+}
+
+// WALReplicator is the replication hook viperblock drives (implemented by
+// walrepl.Client; an interface so the engine stays transport-agnostic and
+// tests can fake it).
+type WALReplicator interface {
+	// Append streams one WAL record; called in WAL order under the WAL
+	// write lock, so implementations must be fast (enqueue/send, not wait).
+	Append(record []byte) error
+	// Barrier blocks until everything appended is durable on the replica.
+	Barrier() error
 }
 
 // syncWALForBarrier fsyncs the active WAL (or all dirty shards) and
@@ -2198,6 +2233,16 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 		}
 		vb.logger().Error("WAL incomplete write, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize)
 		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes (truncated to %d)", n, len(record), preSize)
+	}
+
+	if vb.Replicator != nil {
+		// Stream the exact record bytes to the peer, still under the WAL
+		// lock so replica order equals file order (fork F2). Append only
+		// enqueues/sends; durability is awaited at the flush barrier.
+		if replicationErr := vb.Replicator.Append(record); replicationErr != nil {
+			vb.WAL.mu.Unlock()
+			return fmt.Errorf("WAL replication append: %w", replicationErr)
+		}
 	}
 
 	vb.WAL.mu.Unlock()
