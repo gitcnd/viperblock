@@ -5485,14 +5485,20 @@ func (vb *VB) Close() error {
 		return firstErr
 	}
 
-	// Remove local WAL and block state files, upload/sync in prior steps.
-	err := vb.RemoveLocalFiles()
-	if err != nil {
-		vb.logger().Error("Failed to remove local files", "err", err)
-	}
-
+	// Remove local WAL and block state files ONLY when the WAL-to-chunk
+	// consolidation above succeeded. On a failed consolidation the local
+	// WAL is the ONLY durable copy of flushed-but-unconsolidated writes;
+	// deleting it here permanently lost an acknowledged, flushed block
+	// (security audit VB-1, CRITICAL, runtime-confirmed by
+	// spinifex project_management/security_repros/vb1_close_dataloss:
+	// pre-fix the reopen read ZERO BLOCK). Keeping the files makes the
+	// next Open's RecoverLocalWALs replay them; fixed 2026-07-28/29.
 	if walErr != nil {
+		vb.logger().Warn("Close: WAL-to-chunk failed; keeping local WAL files for recovery on next open", "err", walErr)
 		return walErr
+	}
+	if err := vb.RemoveLocalFiles(); err != nil {
+		vb.logger().Error("Failed to remove local files", "err", err)
 	}
 	return nil
 }
