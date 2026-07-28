@@ -245,6 +245,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		// Set here, not post-construction like UseShardedWAL below: New
 		// copies GCEnabled once at construction time.
 		GCEnabled: gc_enabled,
+		// The NBD FLUSH a guest fsync maps onto must be a durable barrier
+		// (spinifex Phase 1 gate P1.4; see SyncOnFlush's doc comment).
+		SyncOnFlush: true,
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)

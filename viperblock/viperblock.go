@@ -337,6 +337,22 @@ type VB struct {
 	// (see ensureGCSnapshotSafe) has a durable answer.
 	GCEnabled bool
 
+	// SyncOnFlush makes Flush() a DURABLE barrier: after draining the
+	// memory buffer into the WAL, the active WAL file is fsynced before
+	// Flush returns. Without it, the barrier every guest fsync maps onto
+	// (NBD/virtio FLUSH -> vb.Flush) only reaches the page cache, and a
+	// host power loss inside the periodic syncer's window (default 200 ms)
+	// loses writes the guest was told were flushed -- proven at syscall
+	// level 2026-07-27 (tests/crashharness/results/
+	// 2026-07-27_flush_no_fsync_finding.txt: zero fsyncs across 50
+	// explicit NBD flushes). Costs one fsync per barrier (measured
+	// 1.6-5.6 ms p50 on a SATA SSD, ambient-dependent). Opt-in for now so
+	// existing embedders keep their timing; serving entrypoints (nbdkit
+	// plugin, NBD/vhost servers) should enable it. Part of the spinifex
+	// project's Phase 1 (gate P1.4); the F2 peer-replication barrier
+	// extends the same hook.
+	SyncOnFlush bool
+
 	// GCInterval controls how often the background chunk uploader also runs
 	// a GC sweep (default DefaultGCInterval). <= 0 disables the periodic
 	// sweep, but Close/DrainToBackend still run one on the way out. Ignored
@@ -1062,6 +1078,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		GCEnabled:           config.GCEnabled,
 		GCInterval:          config.GCInterval,
+		SyncOnFlush:         config.SyncOnFlush,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
 		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: blockToObjectWALMagic},
@@ -1835,9 +1852,65 @@ func (vb *VB) Flush() (err error) {
 	vb.Writes.mu.Lock()
 	defer vb.Writes.mu.Unlock()
 	if vb.UseShardedWAL {
-		return vb.flushLockedSharded()
+		if err := vb.flushLockedSharded(); err != nil {
+			return err
+		}
+	} else {
+		if err := vb.flushLocked(); err != nil {
+			return err
+		}
 	}
-	return vb.flushLocked()
+	if vb.SyncOnFlush {
+		// Durable barrier (gate P1.4): the records just written must be on
+		// stable storage before the guest's FLUSH is acknowledged.
+		return vb.syncWALForBarrier()
+	}
+	return nil
+}
+
+// syncWALForBarrier fsyncs the active WAL (or all dirty shards) and
+// RETURNS the error -- unlike syncWALIfDirty, which logs and defers to the
+// next background tick. A barrier that cannot sync must fail the barrier.
+func (vb *VB) syncWALForBarrier() error {
+	if vb.UseShardedWAL {
+		sw := vb.ShardedWAL
+		if sw == nil {
+			return nil
+		}
+		for i := range NumShards {
+			shard := sw.Shards[i]
+			if !shard.dirty.Load() {
+				continue
+			}
+			shard.dirty.Store(false)
+			shard.mu.RLock()
+			var err error
+			if shard.DB != nil {
+				err = shard.DB.Sync()
+			}
+			shard.mu.RUnlock()
+			if err != nil {
+				shard.dirty.Store(true)
+				return fmt.Errorf("barrier sync shard %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	if !vb.WAL.dirty.Load() {
+		return nil
+	}
+	vb.WAL.dirty.Store(false)
+	vb.WAL.mu.RLock()
+	defer vb.WAL.mu.RUnlock()
+	if len(vb.WAL.DB) > 0 {
+		if activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]; activeWAL != nil {
+			if err := activeWAL.Sync(); err != nil {
+				vb.WAL.dirty.Store(true)
+				return fmt.Errorf("barrier sync WAL: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
