@@ -34,9 +34,14 @@ func (s *slowBackend) WriteCtx(ctx context.Context, fileType types.FileType, obj
 }
 
 // newBackpressureTestVB builds a minimal file-backed VB (legacy single-file
-// WAL, no LRU cache, periodic syncers disabled for deterministic behavior)
-// and swaps in a slowBackend so drains take drainDelay per backend write.
-func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time.Duration) *VB {
+// WAL, no LRU cache, WAL syncer disabled) and swaps in a slowBackend so
+// drains take drainDelay per backend write. chunkUploadInterval <= 0
+// disables the background uploader entirely (writers then drive drains
+// inline via awaitBackpressure's fallback); a large positive value (e.g.
+// time.Hour) runs the uploader goroutine but leaves it purely
+// trigger-driven, which is the deterministic stand-in for the production
+// serving shape.
+func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time.Duration, chunkUploadInterval time.Duration) *VB {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -52,12 +57,20 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 		VolumeName: testVol,
 		VolumeSize: 64 * 1024 * 1024,
 		BaseDir:    fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
-		// Deterministic: no background WAL fsync or ticker-driven chunk
-		// upload racing the test; the backpressure gate itself is what we're
-		// exercising.
+		// Deterministic: no background WAL fsync racing the test; chunk
+		// uploads only when disabled (<= 0) or trigger-driven (large
+		// interval), never on a mid-test ticker.
 		WALSyncInterval:     -1,
-		ChunkUploadInterval: -1,
+		ChunkUploadInterval: chunkUploadInterval,
 		MaxPendingBytes:     maxPendingBytes,
+		// Serial chunk uploads so drain time scales with chunk count: the
+		// admission-latency gate below must distinguish "released after ONE
+		// chunk freed headroom" from "held for a full drain" -- with the
+		// default 16-wide worker pool a small full drain finishes in ~one
+		// batch and the two contracts are indistinguishable (verified by a
+		// differential run 2026-07-28: the old drain-to-low code PASSED the
+		// gate until uploads were serialized).
+		UploadWorkers: 1,
 		Cache: Cache{
 			Config: CacheConfig{Size: 0},
 		},
@@ -68,8 +81,11 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 	require.NotNil(t, vb)
 
 	// Registered before the setup below can call FailNow, which would otherwise
-	// skip cleanup and leave the VB tree behind.
+	// skip cleanup and leave the VB tree behind. Stops are no-ops when the
+	// corresponding goroutine was never started.
 	t.Cleanup(func() {
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
 		assert.NoError(t, vb.RemoveLocalFiles())
 	})
 
@@ -95,7 +111,7 @@ func TestWriteAtBackpressureBoundsPendingBytes(t *testing.T) {
 	const maxPendingBytes = 256 * 1024 // 64 blocks @ 4KB
 	const numBlocks = 2000             // 2000 * 4KB ~= 8MB total written
 
-	vb := newBackpressureTestVB(t, maxPendingBytes, 15*time.Millisecond)
+	vb := newBackpressureTestVB(t, maxPendingBytes, 15*time.Millisecond, -1)
 
 	blockSize := uint64(vb.BlockSize)
 	totalWritten := uint64(numBlocks) * blockSize
@@ -172,13 +188,21 @@ func TestWriteAtBackpressureBoundsPendingBytes(t *testing.T) {
 
 // TestWriteAtBackpressureBlocksThenReleases directly measures that a single
 // WriteAt call which pushes pendingBytes over MaxPendingBytes blocks for
-// roughly the drain latency, and that pendingBytes drops back to the low
-// watermark (MaxPendingBytes/2) by the time the call returns.
+// roughly the drain latency, and that pending has fallen at least back to
+// the high watermark by the time the call returns.
+//
+// CONTRACT NOTE (restructured 2026-07-28, P1.6): this VB runs WITHOUT a
+// background uploader, so the blocked writer itself drives a FULL inline
+// DrainToBackendCtx -- after which pending is (far) below the old low
+// watermark, so the original low-watermark assertion still holds on this
+// fallback path and is kept. The production serving shape (uploader
+// running) is covered by TestWriteAtAdmissionLatencyBoundedWithUploader,
+// where writers wait for headroom instead of driving drains.
 func TestWriteAtBackpressureBlocksThenReleases(t *testing.T) {
 	const maxPendingBytes = 64 * 1024 // 16 blocks @ 4KB
 	const drainDelay = 50 * time.Millisecond
 
-	vb := newBackpressureTestVB(t, maxPendingBytes, drainDelay)
+	vb := newBackpressureTestVB(t, maxPendingBytes, drainDelay, -1)
 	blockSize := uint64(vb.BlockSize)
 
 	// Fill up to (but not past) the high watermark: these calls must not block.
@@ -208,4 +232,118 @@ func TestWriteAtBackpressureBlocksThenReleases(t *testing.T) {
 
 	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
 	assert.Equal(t, uint64(0), vb.PendingBytes())
+}
+
+// TestWriteAtAdmissionLatencyBoundedWithUploader is the unit leg of spinifex
+// gate P1.6 (sustained-write stalls bounded). It reproduces the production
+// serving shape -- background uploader RUNNING, writes outrunning a slow
+// backend past the high watermark -- and asserts the restructured
+// backpressure contract: a blocked write is admitted as soon as drained
+// chunks free headroom (~one chunk's drain time), never held for the
+// drain-to-low-watermark quantum that froze guest I/O for minutes
+// (246 s single-write clat max measured in-guest 2026-07-28; the old
+// contract's worst case here would be a full drain of maxPendingBytes,
+// ~12 chunk uploads x 300 ms >= ~3.6 s serial).
+//
+// WHAT IS GATED: per-write admission latency bound (2.0 s -- justified by
+// differential measurement 2026-07-28 on this geometry: old drain-to-low
+// contract FAILS at 4.65 s, new headroom contract passes at 1.17 s under
+// -race, so the bound sits ~2x above the passing measurement and ~2.3x
+// below the failing one) + memory boundedness + data correctness.
+// WHAT IS REPORTED: the observed max admission latency.
+func TestWriteAtAdmissionLatencyBoundedWithUploader(t *testing.T) {
+	const maxPendingBytes = 48 * 1024 * 1024 // 12 x 4 MiB chunks
+	const drainDelay = 300 * time.Millisecond
+	const throttledWrites = 256
+
+	// time.Hour = uploader goroutine alive but purely trigger-driven: the
+	// only drains are the ones blocked writers request via
+	// signalDrainWanted (maxPendingBytes < default FlushSize, so
+	// signalSizeTrigger stays inert by design).
+	vb := newBackpressureTestVB(t, maxPendingBytes, drainDelay, time.Hour)
+	blockSize := uint64(vb.BlockSize)
+
+	var maxObservedPending atomic.Uint64
+	stopSampler := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if v := vb.PendingBytes(); v > maxObservedPending.Load() {
+					maxObservedPending.Store(v)
+				}
+			case <-stopSampler:
+				return
+			}
+		}
+	}()
+
+	// Fill phase: exactly up to the high watermark, unblocked memory writes.
+	fillBlocks := uint64(maxPendingBytes) / blockSize
+	for i := range fillBlocks {
+		data := make([]byte, blockSize)
+		copy(data, fmt.Sprintf("fill-%d", i))
+		require.NoError(t, vb.WriteAt(i*blockSize, data))
+	}
+
+	// Throttled phase: every write now crosses the watermark and must wait
+	// for drained-chunk headroom -- but never for a full drain.
+	var maxAdmissionLatency time.Duration
+	for i := range uint64(throttledWrites) {
+		data := make([]byte, blockSize)
+		copy(data, fmt.Sprintf("throttled-%d", i))
+		start := time.Now()
+		require.NoError(t, vb.WriteAt((fillBlocks+i)*blockSize, data))
+		if elapsed := time.Since(start); elapsed > maxAdmissionLatency {
+			maxAdmissionLatency = elapsed
+		}
+	}
+
+	close(stopSampler)
+	<-samplerDone
+
+	t.Logf("max admission latency = %v (bound 2s); max observed pending = %d (high watermark %d)",
+		maxAdmissionLatency, maxObservedPending.Load(), maxPendingBytes)
+
+	// Gate engaged: at least one write must actually have blocked on the
+	// slow backend, or this test proves nothing.
+	assert.GreaterOrEqual(t, maxAdmissionLatency, 100*time.Millisecond,
+		"no write ever blocked; the backpressure gate was not exercised")
+
+	// THE P1.6 BOUND: admission latency is one-chunk-class, not
+	// full-drain-class. The old contract measured 4.65 s here.
+	assert.LessOrEqual(t, maxAdmissionLatency, 2*time.Second,
+		"a write waited longer than the drained-chunk admission bound; writers are being held for full drains again")
+
+	// Memory stays bounded at the watermark plus one in-flight write.
+	assert.LessOrEqual(t, maxObservedPending.Load(), uint64(maxPendingBytes)+blockSize,
+		"pending bytes exceeded MaxPendingBytes + one block")
+
+	// Correctness: the throttled writes and a sample of the fill range read
+	// back exactly (throttled blocks may still be buffered; fill blocks may
+	// be in chunks -- both tiers must agree).
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+	assert.Equal(t, uint64(0), vb.PendingBytes())
+	for i := range uint64(throttledWrites) {
+		got, err := vb.ReadAt((fillBlocks+i)*blockSize, blockSize)
+		if !assert.NoError(t, err, "throttled block %d", i) {
+			continue
+		}
+		expected := make([]byte, blockSize)
+		copy(expected, fmt.Sprintf("throttled-%d", i))
+		assert.Equal(t, expected, got, "throttled block %d mismatch", i)
+	}
+	for _, i := range []uint64{0, fillBlocks / 3, fillBlocks / 2, fillBlocks - 1} {
+		got, err := vb.ReadAt(i*blockSize, blockSize)
+		if !assert.NoError(t, err, "fill block %d", i) {
+			continue
+		}
+		expected := make([]byte, blockSize)
+		copy(expected, fmt.Sprintf("fill-%d", i))
+		assert.Equal(t, expected, got, "fill block %d mismatch", i)
+	}
 }

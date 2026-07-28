@@ -198,6 +198,25 @@ type VB struct {
 	// successful drain.
 	backendFull atomic.Bool
 
+	// backgroundDrainerRunning is true while the StartChunkUploader
+	// goroutine is alive. awaitBackpressure consults it to decide who
+	// drives drains for writers blocked at the high watermark: when the
+	// uploader is running, blocked writers only WAIT for headroom (the
+	// uploader drains and headroom appears per uploaded chunk); a writer
+	// drives DrainToBackendCtx inline only when there is no uploader
+	// (embedders that disable it, e.g. ChunkUploadInterval <= 0). Added
+	// 2026-07-28 for the P1.6 drain-stall fix: an inline full drain held
+	// a single guest write hostage for minutes (246 s measured in-guest).
+	backgroundDrainerRunning atomic.Bool
+
+	// consecutiveDrainFailures counts DrainToBackendCtx failures since the
+	// last success (updated at that single choke point). Writers waiting
+	// in awaitBackpressure bail out with an error once it crosses
+	// maxConsecutiveDrainFailuresWhileWaiting, preserving the old
+	// "10 failed drains fails the write" contract now that waiting
+	// writers no longer drive (and thus no longer observe) drains.
+	consecutiveDrainFailures atomic.Int32
+
 	// drainMu serializes DrainToBackendCtx across all its triggers. Two
 	// concurrent drains would rotate to different WAL segments and race in
 	// createChunkFile, where an older segment landing last can clobber a
@@ -1249,6 +1268,11 @@ func (vb *VB) StartChunkUploader() {
 		gcTickerC = vb.gcTicker.C
 	}
 
+	// Published before the goroutine starts so a writer that blocks at the
+	// high watermark immediately after StartChunkUploader returns waits for
+	// the uploader instead of racing it with an inline drain.
+	vb.backgroundDrainerRunning.Store(true)
+
 	go func() {
 		defer close(vb.chunkUploadDone)
 		defer vb.chunkUploadTicker.Stop()
@@ -1294,6 +1318,11 @@ func (vb *VB) StopChunkUploader() {
 
 	close(vb.chunkUploadStop)
 	<-vb.chunkUploadDone
+
+	// Cleared only after the goroutine has fully exited: from here on,
+	// writers blocked in awaitBackpressure fall back to driving drains
+	// inline rather than waiting for an uploader that no longer exists.
+	vb.backgroundDrainerRunning.Store(false)
 
 	vb.chunkUploadStop = nil
 	vb.chunkUploadDone = nil
@@ -1532,61 +1561,91 @@ func (vb *VB) signalSizeTrigger() {
 }
 
 // awaitBackpressure blocks the caller once pendingBytes has crossed
-// MaxPendingBytes, driving DrainToBackendCtx synchronously until pendingBytes
-// falls back under the low-watermark (MaxPendingBytes/2). This is the core
-// backpressure mechanism: a guest write that outruns the backend's ingest
-// rate self-throttles here instead of growing Writes.Blocks /
+// MaxPendingBytes (the high watermark) until drained chunks free HEADROOM
+// (pending back at or under the watermark). This is the core backpressure
+// mechanism: a guest write that outruns the backend's ingest rate
+// self-throttles here instead of growing Writes.Blocks /
 // PendingBackendWrites.Blocks without bound.
 //
-// Called after WriteAtCtx has already released vb.Writes.mu, so the Flush()
-// invoked by DrainToBackendCtx (which takes that same lock) cannot deadlock
-// against us. drainInFlight ensures only one blocked writer actually drives
-// the drain at a time; the rest poll pendingBytes with a bounded backoff.
+// CONTRACT RESTRUCTURED 2026-07-28 (P1.6 drain-stall fix). A blocked
+// writer now waits only for pending <= high. pendingBytes falls
+// incrementally as each drained chunk uploads (createChunkFile), so
+// headroom appears chunk-by-chunk (~ChunkSize) and a blocked write is
+// released after at most ~one chunk's drain time. The previous contract
+// made the crossing writer drive a FULL DrainToBackendCtx inline and wait
+// for the LOW watermark (high/2) -- a 128 MiB admission quantum at default
+// settings that held one guest write (and the whole virtio queue behind
+// it) hostage for the entire drain: measured in-guest at up to 246 s on
+// random 4 KiB writes (viperblock vhostuser/results/
+// 2026-07-28_inguest_fio_real_engine_vs_raw_vhost.txt). Hysteresis toward
+// empty is unchanged in effect: every background drain is a full
+// DrainToBackendCtx, and the size trigger keeps it running while
+// pendingBytes remains above FlushSize.
 //
-// A drain that fails with ErrNoSpace stops the retry loop immediately
-// instead of backing off: pendingBytes will never fall under the
-// low-watermark on its own once the backend is out of space, so retrying
-// here would just hammer it. The error surfaces to the guest write that
-// triggered this wait.
+// Who drives the drain: while the background chunk uploader is running
+// (the production serving shape), blocked writers only poke its trigger
+// and poll for headroom. A writer drives DrainToBackendCtx inline ONLY
+// when no uploader exists (embedders with ChunkUploadInterval <= 0).
+// Called after WriteAtCtx has already released vb.Writes.mu, so an inline
+// drain's Flush() (which takes that same lock) cannot deadlock against us;
+// drainInFlight keeps concurrent blocked writers from launching redundant
+// inline drains.
+//
+// Failure semantics preserved from the previous contract: ErrNoSpace fails
+// the waiting write immediately (backendFull latch, maintained at the
+// DrainToBackendCtx choke point), and 10 consecutive failed drains fail
+// the write rather than waiting forever (consecutiveDrainFailures,
+// maintained at the same choke point, since waiters no longer observe
+// drain errors directly).
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
 	if vb.PendingBytes() <= high {
 		return nil
 	}
 
-	low := high / 2
-	backoff := 10 * time.Millisecond
-	const maxBackoff = 500 * time.Millisecond
+	// This poll interval is guest-visible write latency once blocked, so
+	// it starts small and caps low (the previous 500 ms cap could oversleep
+	// an already-admitted write by half a second).
+	backoff := time.Millisecond
+	const maxBackoff = 32 * time.Millisecond
 
-	// Bound consecutive non-ErrNoSpace drain failures so a persistently
-	// failing drain doesn't spin here forever; a single success resets the
-	// count so transient backend slowness doesn't trip it.
 	const maxDrainFailures = 10
-	drainFailures := 0
+	inlineDrainFailures := 0
 
-	for vb.PendingBytes() > low {
+	for vb.PendingBytes() > high {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if vb.backendFull.Load() {
+			return ErrNoSpace
+		}
+		if failures := vb.consecutiveDrainFailures.Load(); failures >= maxDrainFailures {
+			return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting", failures)
+		}
 
-		if vb.drainInFlight.CompareAndSwap(false, true) {
+		if vb.backgroundDrainerRunning.Load() {
+			// The uploader owns draining: ensure it knows work is wanted
+			// (coalesces with any pending trigger) and wait for headroom.
+			vb.signalDrainWanted()
+		} else if vb.drainInFlight.CompareAndSwap(false, true) {
+			// No uploader exists: drive the drain ourselves, one blocked
+			// writer at a time; the rest poll pendingBytes.
 			err := vb.DrainToBackendCtx(ctx)
 			vb.drainInFlight.Store(false)
 			if err != nil {
 				if errors.Is(err, ErrNoSpace) {
 					return err
 				}
-				drainFailures++
-				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err, "consecutiveFailures", drainFailures)
-				if drainFailures >= maxDrainFailures {
-					return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting: %w", drainFailures, err)
+				inlineDrainFailures++
+				vb.logger().Warn("write backpressure: inline drain failed, retrying", "err", err, "consecutiveFailures", inlineDrainFailures)
+				if inlineDrainFailures >= maxDrainFailures {
+					return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting: %w", inlineDrainFailures, err)
 				}
 			} else {
-				drainFailures = 0
+				inlineDrainFailures = 0
 			}
-			if vb.PendingBytes() <= low {
-				break
-			}
+			// Re-check pending immediately after a full inline drain.
+			continue
 		}
 
 		select {
@@ -1600,6 +1659,18 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// signalDrainWanted pokes the background uploader's trigger channel
+// unconditionally (unlike signalSizeTrigger, which gates on FlushSize): a
+// writer blocked at the high watermark needs a drain regardless of the
+// soft threshold, including configurations where MaxPendingBytes is below
+// FlushSize. Non-blocking; a pending trigger coalesces.
+func (vb *VB) signalDrainWanted() {
+	select {
+	case vb.chunkUploadTrigger <- struct{}{}:
+	default:
+	}
 }
 
 // backendNearFuller lets a backend report pre-full backpressure out-of-band
@@ -1856,15 +1927,18 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	defer vb.drainMu.Unlock()
 
 	// Every drain path funnels through here, so this is the single choke
-	// point for the backendFull latch: an out-of-space error anywhere in
-	// the drain sets it, and a clean completion clears it.
+	// point for the backendFull latch (an out-of-space error anywhere in
+	// the drain sets it, a clean completion clears it) and for the
+	// consecutive-failure counter awaitBackpressure's waiters watch.
 	defer func() {
 		if err != nil {
+			vb.consecutiveDrainFailures.Add(1)
 			if errors.Is(err, ErrNoSpace) {
 				vb.backendFull.Store(true)
 			}
 			return
 		}
+		vb.consecutiveDrainFailures.Store(0)
 		vb.backendFull.Store(false)
 	}()
 
