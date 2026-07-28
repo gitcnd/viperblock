@@ -183,19 +183,23 @@ func (b *Backend) handleMessage(connection *net.UnixConn, message *Message) erro
 		return b.ackIfNeeded(connection, message)
 
 	case RequestSetVringNum:
-		value, err := DecodeU64Payload(message.Payload)
-		if err != nil {
-			return err
+		// Payload is struct vhost_vring_state { u32 index; u32 num }, NOT a
+		// bare u64: num lives at offset 4. Reading the low u32 (index) here
+		// left the queue size at 0, so the queue never started and every
+		// guest I/O to the device hung (guest udev timeout). Found via
+		// backend logging against a real QEMU guest, 2026-07-28.
+		if len(message.Payload) < 8 {
+			return fmt.Errorf("set-vring-num payload %d bytes", len(message.Payload))
 		}
-		b.queueState.sizeDescriptors = uint16(value & 0xFFFF)
+		b.queueState.sizeDescriptors = uint16(binary.LittleEndian.Uint32(message.Payload[4:8]))
 		return b.ackIfNeeded(connection, message)
 
 	case RequestSetVringBase:
-		value, err := DecodeU64Payload(message.Payload)
-		if err != nil {
-			return err
+		// struct vhost_vring_state { u32 index; u32 base }: base at offset 4.
+		if len(message.Payload) < 8 {
+			return fmt.Errorf("set-vring-base payload %d bytes", len(message.Payload))
 		}
-		b.queueState.lastAvailBase = uint16(value & 0xFFFF)
+		b.queueState.lastAvailBase = uint16(binary.LittleEndian.Uint32(message.Payload[4:8]))
 		return b.ackIfNeeded(connection, message)
 
 	case RequestSetVringAddr:
@@ -375,6 +379,7 @@ func (b *Backend) serveQueueUntilStopped() {
 		b.queueAccessMutex.Lock()
 		queue := b.queueState.queue
 		chains, err := queue.PopAvailableChains()
+		b.Logger.Info("kick", "chains", len(chains), "err", err)
 		if err != nil {
 			b.queueAccessMutex.Unlock()
 			b.Logger.Error("vhost-user: ring walk failed", "err", err)
@@ -410,6 +415,7 @@ func (b *Backend) processBlockRequest(chain *DescriptorChain) uint32 {
 	header := chain.ReadableSpans[0]
 	requestType := binary.LittleEndian.Uint32(header[0:4])
 	sector := binary.LittleEndian.Uint64(header[8:16])
+	b.Logger.Info("blk req", "type", requestType, "sector", sector, "readable", len(chain.ReadableSpans), "writable", len(chain.WritableSpans))
 	offsetBytes := sector * virtioBlockSectorSizeBytes
 	statusSpan := chain.WritableSpans[statusSpanIndex]
 	dataWritableSpans := chain.WritableSpans[:statusSpanIndex]

@@ -153,8 +153,11 @@ func (f *syntheticFrontend) negotiate() {
 	binary.LittleEndian.PutUint64(memPayload[32:40], 0)
 	f.sendMessage(RequestSetMemTable, 0, memPayload, []int{int(f.memoryFile.Fd())})
 
-	f.sendMessage(RequestSetVringNum, 0, U64Payload(uint64(f.queueSize)), nil)
-	f.sendMessage(RequestSetVringBase, 0, U64Payload(0), nil)
+	// vhost_vring_state { u32 index=0; u32 num } -- num at offset 4.
+	vringNumPayload := make([]byte, 8)
+	binary.LittleEndian.PutUint32(vringNumPayload[4:8], uint32(f.queueSize))
+	f.sendMessage(RequestSetVringNum, 0, vringNumPayload, nil)
+	f.sendMessage(RequestSetVringBase, 0, make([]byte, 8), nil)
 
 	addrPayload := make([]byte, 40)
 	binary.LittleEndian.PutUint64(addrPayload[8:16], frontendFakeUserBase+f.descriptorTableOffset)
