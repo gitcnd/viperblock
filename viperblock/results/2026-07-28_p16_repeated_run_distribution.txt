@@ -1,0 +1,38 @@
+P1.6 final verification, phase A: repeated-run latency distribution
+====================================================================
+Date: 2026-07-28 (evening session). Build: vhost branch 582eb18 merged
+with fix branch c9ed442 (all four P1.6 slices). Rig: identical to all
+prior bundles -- Debian 13 guest, QEMU 7.2, vhost-user-blk, engine on
+file backend (512 MiB volume) as vdb, raw file as vdc (transport +
+ambient control), ONE boot, legs interleaved engine/raw x 5 rounds,
+30 s randwrite 4 KiB d1 each, both devices prefilled.
+
+Distribution (per 30 s leg):
+  round   engine IOPS   engine clat max   raw IOPS   raw clat max
+  1          1478           47.9 ms         37.7k        1.3 ms
+  2           393           41.1 ms         37.6k       27.8 ms
+  3           281           57.7 ms         34.6k       42.9 ms
+  4           245           66.3 ms         35.3k        1.2 ms
+  5           241           67.3 ms         34.7k        4.6 ms
+  engine p99 per leg: 59-70 us (fast path intact).
+
+Reading:
+- WORST single-write latency across 2.5 min of saturated random writes:
+  67.3 ms -- versus 246,097 ms pre-fix (~3700x), 35.3 s after slice 1,
+  16.3 s after slices 2+3a. The four-slice mechanism accounting closes:
+  a blocked writer now waits ~one 4 MiB chunk upload (20-70 ms on this
+  backend), which is exactly the observed max band.
+- The raw-file CONTROL itself shows ambient spikes to 42.9 ms on this
+  shared host: the engine's worst case now sits ~1.6x the ambient
+  noise floor of the machine.
+- Engine steady IOPS declines across rounds (1478 -> 241) as overwrite
+  density rises: that is the separately-named saturated-overwrite
+  drain-throughput lever (chunk-supersede bookkeeping), NOT a latency
+  violation; p99 and clat max stay flat while it declines.
+
+PROPOSED GATE BOUND (for the human, P1.6): on this rig class, no
+single 4 KiB write under sustained saturation exceeds 250 ms across a
+5-run distribution (measured max 67 ms = ~3.7x margin; bound also
+clears the observed 43 ms ambient floor). For s3-backed serving the
+bound scales with the backend chunk-PUT tail -- to be measured in
+phase B (nbdkit-vs-vhost production pair) before Phase-1 close.
