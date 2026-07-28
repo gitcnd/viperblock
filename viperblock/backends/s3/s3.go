@@ -30,7 +30,7 @@ import (
 
 // poolPressureHeader is the response header predastore sets on a successful
 // PutObject once its storage pool nears FULL (FULL itself is instead
-// signalled via HTTP 507/503, see classifyWriteErr).
+// signalled via HTTP 507, see classifyWriteErr).
 const poolPressureHeader = "X-Predastore-Pool-Pressure"
 
 // poolPressureNearFull is the only header value this backend acts on.
@@ -78,10 +78,19 @@ func wrapNotFound(err error) error {
 	return err
 }
 
-// classifyWriteErr maps a PutObject error into types.ErrNoSpace when the HTTP
-// status is 507 (Insufficient Storage) or 503 (Service Unavailable) --
-// predastore's two signals for "out of space". Any other error passes
+// classifyWriteErr maps a PutObject error into types.ErrNoSpace ONLY when the
+// HTTP status is 507 (Insufficient Storage) -- predastore's single signal that
+// the store is genuinely full. Every other error, including 503, passes
 // through unchanged.
+//
+// 503 must NOT be treated as out-of-space: predastore returns 503 SlowDown
+// from its PutObject rate limiter, which is transient backpressure ("retry
+// with backoff"), not a full store. Mapping it to ErrNoSpace latched the
+// backendFull flag, and since every retry re-tripped the rate limit the latch
+// never cleared -- wedging the volume permanently under sustained churn. Left
+// as an ordinary error, a persistent 503 surfaces as a failed drain the
+// uploader retries on its next tick while write backpressure throttles the
+// guest, so the volume self-throttles instead of failing.
 func classifyWriteErr(err error) error {
 	if err == nil {
 		return nil
@@ -89,8 +98,7 @@ func classifyWriteErr(err error) error {
 
 	var respErr *smithyhttp.ResponseError
 	if errors.As(err, &respErr) {
-		switch respErr.HTTPStatusCode() {
-		case http.StatusInsufficientStorage, http.StatusServiceUnavailable:
+		if respErr.HTTPStatusCode() == http.StatusInsufficientStorage {
 			return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
 		}
 	}
@@ -335,8 +343,18 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 		return nil, err
 	}
 
-	// The response should contain exactly the bytes we requested
-	// No slicing needed since we requested the exact range
+	// A ranged GET whose range starts inside the object but runs past its end
+	// is answered with a CLAMPED 206 -- a short body with a matching
+	// Content-Length, so io.ReadAll returns it without error. Callers copy the
+	// result into a full-size, zero-initialised buffer, so an unchecked short
+	// body becomes a silently zero-filled tail that is then cached as valid.
+	// Verified against predastore: asking for 1024 bytes past EOF returns
+	// exactly the available bytes with no error. Refuse it here instead.
+	if length > 0 && len(res) != int(length) {
+		return nil, fmt.Errorf("%w: %s offset %d: backend returned %d bytes, expected %d",
+			types.ErrShortRead, filename, offset, len(res), length)
+	}
+
 	return res, nil
 }
 

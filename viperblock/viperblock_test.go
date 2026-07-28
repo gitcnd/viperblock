@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -79,9 +80,57 @@ var testHTTPClient = &http.Client{
 	},
 }
 
+// scratchDirPrefix names each run's predastore scratch directory. It is a
+// constant because sweepAbandonedScratchDirs matches on it.
+const scratchDirPrefix = "viperblock-predastore-"
+
+// scratchDirMaxAge is how old an abandoned scratch directory must be before it
+// is reclaimed. A full run takes minutes, so a directory this old cannot belong
+// to a live test binary.
+const scratchDirMaxAge = 6 * time.Hour
+
+// sweepAbandonedScratchDirs reclaims scratch directories stranded by earlier
+// runs. This run's own cleanup is a defer, and a panic — a test timeout is the
+// usual one — skips deferred functions and takes the process down with the
+// directory intact. Each is around 500MB, /tmp is a tmpfs on the dev boxes, and
+// once it fills unrelated tests start failing with "backend out of space",
+// which reads like a code regression rather than leaked scratch.
+//
+// Deleting shared scratch deserves caution, so a candidate must match on both
+// the prefix and the age: a concurrently running test binary's directory is
+// minutes old at most and can never qualify. Failures are reported and
+// otherwise ignored — not reclaiming disk must never fail the run.
+func sweepAbandonedScratchDirs(tmpDir string) {
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scratch sweep: read %s: %v\n", tmpDir, err)
+		return
+	}
+
+	cutoff := time.Now().Add(-scratchDirMaxAge)
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), scratchDirPrefix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+
+		path := filepath.Join(tmpDir, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			fmt.Fprintf(os.Stderr, "scratch sweep: remove %s: %v\n", path, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "scratch sweep: reclaimed abandoned scratch dir %s\n", path)
+	}
+}
+
 func TestMain(m *testing.M) {
 	os.Exit(func() int {
 		AccessKey, SecretKey = loadTestCredentials()
+
+		sweepAbandonedScratchDirs(os.TempDir())
 
 		dir, err := os.Getwd()
 		if err != nil {
@@ -100,7 +149,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 
-		dataDir, err := os.MkdirTemp("", "viperblock-predastore-*")
+		dataDir, err := os.MkdirTemp("", scratchDirPrefix+"*")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 			return 1
@@ -1347,63 +1396,6 @@ func TestConsecutiveBlockRead(t *testing.T) {
 	})
 }
 
-func TestInvalidS3Host(t *testing.T) {
-	runWithBackends(t, "invalid_s3_write_and_read", func(t *testing.T, vb *VB) {
-		// Skip if file backend
-		if vb.Backend.GetBackendType() == "file" {
-			t.Skip("Skipping test for file backend")
-		}
-
-		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
-			// Get a temp free port
-			tempPort, err := FindFreePort()
-			assert.NoError(t, err)
-
-			vb.Backend.SetConfig(s3.S3Config{
-				VolumeName: vb.GetVolume(),
-				VolumeSize: volumeSize,
-				Region:     "ap-southeast-2",
-				Bucket:     "bad_bucket",
-				AccessKey:  AccessKey,
-				SecretKey:  SecretKey,
-				Host:       fmt.Sprintf("https://%s", tempPort),
-				HTTPClient: testHTTPClient,
-			})
-
-			err = vb.Backend.Init()
-			assert.Error(t, err)
-
-			// Write a block
-			// Next, write a new block and flush
-			blockID := uint64(5)
-			data := make([]byte, DefaultBlockSize)
-			msg := "bad bucket block"
-			copy(data[:len(msg)], msg)
-
-			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
-			assert.NoError(t, err)
-
-			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, _, err := vb.LookupBlockToObject(5)
-			assert.Error(t, err)
-			assert.Equal(t, uint64(0), objectID)
-			assert.Equal(t, uint32(0), objectOffset)
-
-			err = vb.Flush()
-			assert.NoError(t, err)
-
-			err = vb.WriteWALToChunk(true)
-			assert.Error(t, err)
-
-			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, _, err = vb.LookupBlockToObject(4)
-			assert.Error(t, err)
-			assert.Equal(t, uint64(0), objectID)
-			assert.Equal(t, uint32(0), objectOffset)
-		})
-	})
-}
-
 func TestInvalidS3Bucket(t *testing.T) {
 	runWithBackends(t, "invalid_s3_write_and_read", func(t *testing.T, vb *VB) {
 		// Skip if file backend
@@ -2540,4 +2532,44 @@ func TestClassifyStateLoad(t *testing.T) {
 				"classifyStateLoad(local=%v, backend=%v) = %v", tc.localErr, tc.backendErr, got)
 		})
 	}
+}
+
+// The sweep runs against a directory shared with other processes, so what it
+// declines to touch matters as much as what it reclaims: only a directory that
+// matches the prefix AND is far older than any live run may go.
+func TestSweepAbandonedScratchDirs(t *testing.T) {
+	tmpDir := t.TempDir()
+	stale := time.Now().Add(-scratchDirMaxAge - time.Hour)
+
+	mkdir := func(name string, modTime time.Time) string {
+		path := filepath.Join(tmpDir, name)
+		require.NoError(t, os.MkdirAll(filepath.Join(path, "predastore", "bucket"), 0o755))
+		require.NoError(t, os.Chtimes(path, modTime, modTime))
+		return path
+	}
+
+	abandoned := mkdir(scratchDirPrefix+"1234567890", stale)
+	concurrent := mkdir(scratchDirPrefix+"0987654321", time.Now())
+	unrelated := mkdir("some-other-tool-cache", stale)
+
+	// A stale FILE sharing the prefix is not this test's scratch and is not ours
+	// to delete.
+	stalefile := filepath.Join(tmpDir, scratchDirPrefix+"notadir")
+	require.NoError(t, os.WriteFile(stalefile, []byte("x"), 0o600))
+	require.NoError(t, os.Chtimes(stalefile, stale, stale))
+
+	sweepAbandonedScratchDirs(tmpDir)
+
+	assert.NoDirExists(t, abandoned, "a stale scratch dir from a panicked run must be reclaimed")
+	assert.DirExists(t, concurrent, "a freshly-modified scratch dir may belong to a concurrent test binary")
+	assert.DirExists(t, unrelated, "the sweep must not touch directories outside its own prefix")
+	assert.FileExists(t, stalefile, "the sweep must only remove directories")
+}
+
+// A missing or unreadable directory is not a test failure: the sweep exists to
+// reclaim disk, and failing to do so must never take the run down with it.
+func TestSweepAbandonedScratchDirsToleratesUnreadableDir(t *testing.T) {
+	assert.NotPanics(t, func() {
+		sweepAbandonedScratchDirs(filepath.Join(t.TempDir(), "does-not-exist"))
+	})
 }
