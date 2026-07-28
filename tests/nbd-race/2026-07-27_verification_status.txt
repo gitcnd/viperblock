@@ -28,3 +28,11 @@ What this means, stated plainly:
 
 Also banked: GOFIPS140=v1.0.0 is mandatory when building anything that
 embeds viperblock (fipsboot init panics at runtime otherwise).
+
+FINAL (2026-07-28 02:54): long-drain reproducer (100k-write burst per
+iteration, seconds-wide close drain): pre-fix 0/10 hits, post-fix 0/10.
+Total pre-fix attempts across both reproducers: 40, zero hits. The wild
+occurrence needs timing rarer than these odds; differential validation
+abandoned as uneconomical. The fix stands on: code-evident mechanism,
+correctness by construction, zero regressions across 70 post-fix
+connection cycles.
