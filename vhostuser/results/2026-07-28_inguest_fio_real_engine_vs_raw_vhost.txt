@@ -1,0 +1,69 @@
+F7 production wiring evidence: REAL viperblock WAL engine behind
+vhost-user-blk, in-guest, vs raw-file on the identical transport
+=================================================================
+Date: 2026-07-28 (session: post-F7-ack production wiring slice).
+Host: Xeon E5-2697v4, Oracle Linux 9.3, shared/loaded. Guest: Debian 13
+kernel 6.12, 4 vCPU / 2 GiB, QEMU 7.2 (qemu-kvm), q35 +
+memory-backend-memfd,share=on. Load generator: fio IN THE GUEST, 4 KiB,
+--direct=1, --time_based 10s, numjobs=1. Both devices served by the
+SAME vhost-user-blk-serve binary (commit bee3b5b), one guest, one boot:
+  vdb = --vb-backend file  (REAL viperblock WAL engine, file backend,
+        512 MiB volume, production open sequence)
+  vdc = --raw-file         (512 MiB raw file; transport ceiling)
+Both devices pre-filled sequentially before the random legs so engine
+reads exercise the real read path (no zero-block shortcut).
+
+WHAT IS REPORTED (nothing gated; this is decision evidence):
+
+1. Integrity: 16 MiB random pattern written in-guest to vdb (direct),
+   read back byte-identical (md5 7b8c1a2daeb353ef0a8ccc9b81be10ce both
+   sides); host-side raw.img untouched (confirms device mapping).
+
+2. Prefill (sequential 1 MiB writes, 512 MiB):
+   engine 162 MiB/s (3164 ms) | raw 827 MiB/s (619 ms)   (~5.1x)
+
+3. 4 KiB random matrix (IOPS, same boot, legs run sequentially):
+   path       randwrite d1  randwrite d16  randread d1  randread d16
+   vb-engine        592           324          3099          3089
+   raw-file       35.4k         35.2k         35.0k         35.2k
+
+4. THE HEADLINE (write-latency distribution, engine randwrite d1 rerun,
+   10 s time_based that took 248.8 s wall, io=320 MiB):
+   clat min 16 us | p99 65 us | p99.9 108 us | p99.95 139 us
+   clat MAX 246,097,000 us (246 SECONDS -- one write)
+   per-1s-sample IOPS while unblocked: avg 27.3k, max 36.2k (6 samples
+   in 249 s: the device was frozen behind stalled writes the rest).
+   fio lat buckets: 96.6% <= 50 us; 99.97% <= 250 us; >=2s: 0.01%.
+
+Attribution (consistent with P-1.5(i), measured pre-vhost at the
+engine level: p50 5 us, max 175-420 s):
+- The transport is EXONERATED: 99.95% of writes complete <= 139 us
+  through the full vhost-user path incl. the engine fast path, and the
+  burst average (27.3k) approaches the raw transport ceiling (35k).
+- The stalls are the engine's synchronous backpressure drain
+  (awaitBackpressure: pendingBytes > 256 MiB high watermark drives
+  DrainToBackendCtx inline; random 4 KiB writes scatter dirty blocks
+  across chunks, making the drain slow). One write pays the entire
+  drain: minutes-long guest-visible I/O freeze. Reads are steady (3.1k
+  IOPS = backend/cache bound, no stalls) -- read leverage remains
+  cache/backend, as recorded in F7 qualifier 2.
+- Same-boot raw-file numbers rose from the frozen 28.5k (commit
+  a2fc287) to 35.4k after demoting per-request Info logs to Debug --
+  the logging cost ~24% and was measured into the earlier numbers
+  (single runs, shared host; treat the delta as indicative).
+
+Implications recorded in spinifex DECISIONS.md F7 / STATUS:
+- F7 wiring slice: DONE and correct (integrity + fast path proven).
+- The F7 qualifier is now the CRITICAL PATH: engine write concurrency
+  + bounded/asynchronous drains (the Phase 1 "drain-stall" target,
+  P-1.5(i)) must land before any transport benefit is visible at
+  steady state. Transport work is complete enough until then.
+- The nbdkit+engine(s3) vs vhost+engine(s3) production pair is
+  DEFERRED until the drain fix lands: at steady state both would
+  measure the same engine stall, adding no decision value now.
+
+Reproduce: build vhost-user-blk-serve with GOTOOLCHAIN=auto
+GOFIPS140=v1.0.0; serve --vb-backend file --vb-volume f7vol
+--vb-size-bytes 536870912; QEMU line = the P-1.9 rig (bootindex=0 OS
+disk, vhost-user-blk-pci on the serve socket, memfd machine memory);
+fio matrix as above.
