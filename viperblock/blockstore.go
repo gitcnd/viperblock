@@ -444,6 +444,30 @@ func (ubs *UnifiedBlockStore) MarkPending(blockNum uint64) bool {
 	return false
 }
 
+// MarkPendingIfSeqNum is MarkPending guarded by write generation: the
+// Hot -> Pending transition happens only if the store's entry still IS the
+// write that was just WAL-appended (entry.SeqNum == seqNum). The batched
+// flush (flushBatchedLegacy) appends WAL records with Writes.mu released,
+// so a concurrent rewrite can supersede an in-flight record; marking the
+// NEWER hot entry pending would misstate its durability. Mirror of
+// MarkPersisted's stale-drain seqNum guard, added 2026-07-28 (P1.6).
+func (ubs *UnifiedBlockStore) MarkPendingIfSeqNum(blockNum uint64, seqNum uint64) bool {
+	shard := ubs.getShard(blockNum)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, ok := shard.entries[blockNum]
+	if !ok {
+		return false
+	}
+
+	if entry.State == BlockStateHot && entry.SeqNum == seqNum {
+		entry.State = BlockStatePending
+		return true
+	}
+	return false
+}
+
 // MarkPersisted transitions a block from Pending to Persisted state
 // Called by createChunkFile() after backend upload succeeds. seqNum is the
 // sequence number the chunk sealed this block under: the location and seqNum

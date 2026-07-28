@@ -77,15 +77,11 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// Skip if this VB doesn't own the WAL files (e.g. viperblockd snapshot VB
 	// where the NBD plugin process owns the WAL).
 	if vb.ownsWAL() {
-		vb.Writes.mu.Lock()
-		var flushErr error
-		if vb.UseShardedWAL {
-			flushErr = vb.flushLockedSharded()
-		} else {
-			flushErr = vb.flushLocked()
-		}
-		vb.Writes.mu.Unlock()
-		if flushErr != nil {
+		// Route through Flush() rather than an inline lock+dispatch copy:
+		// Flush owns the flushMu serialization and the bounded-batch legacy
+		// path (P1.6 slice 2, 2026-07-28), and this call must not bypass
+		// either.
+		if flushErr := vb.Flush(); flushErr != nil {
 			return nil, fmt.Errorf("snapshot flush failed: %w", flushErr)
 		}
 

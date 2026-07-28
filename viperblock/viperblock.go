@@ -224,6 +224,15 @@ type VB struct {
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
 
+	// flushMu serializes whole Flush() operations against each other (a
+	// drain's flush vs a guest FLUSH barrier vs snapshot-prepare). Before
+	// the P1.6 batched flush (2026-07-28), Writes.mu provided this
+	// serialization as a side effect of being held for the entire flush;
+	// the batched flush releases Writes.mu between batches, so
+	// flush-vs-flush exclusion needs its own lock. Writers (WriteAtCtx)
+	// never take flushMu -- that independence is the entire point.
+	flushMu sync.Mutex
+
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
 	// to drain now instead of waiting for the next ChunkUploadInterval tick,
 	// once pendingBytes crosses FlushSize. Buffered 1: a pending trigger
@@ -1903,12 +1912,126 @@ func (vb *VB) Flush() (err error) {
 		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
 	}()
 
-	vb.Writes.mu.Lock()
-	defer vb.Writes.mu.Unlock()
+	// flushMu: one Flush at a time (drain flush vs guest barrier vs
+	// snapshot-prepare); see the field's doc comment.
+	vb.flushMu.Lock()
+	defer vb.flushMu.Unlock()
+
 	if vb.UseShardedWAL {
+		// The sharded WAL path keeps the original whole-buffer-under-lock
+		// shape: it exists to spread lock contention across shards and is
+		// not the serving default (legacy WAL is).
+		vb.Writes.mu.Lock()
+		defer vb.Writes.mu.Unlock()
 		return vb.flushLockedSharded()
 	}
-	return vb.flushLocked()
+	return vb.flushBatchedLegacy()
+}
+
+// flushBatchedBlocksPerLockRelease bounds how many buffered blocks one
+// flush batch snapshots before Writes.mu is released again (4096 x 4 KiB =
+// 16 MiB per batch). The WAL appends themselves happen OFF the lock; this
+// constant only bounds the memory copy/filter work done while holding it.
+const flushBatchedBlocksPerLockRelease = 4096
+
+// flushBatchedLegacy flushes hot writes to the legacy WAL in bounded
+// batches, holding vb.Writes.mu only for the per-batch snapshot and the
+// per-batch removal -- never across WAL I/O.
+//
+// WHY (P1.6 slice 2, 2026-07-28): the previous flushLocked held Writes.mu
+// across one WAL append PER BUFFERED BLOCK; at a 256 MiB buffer that is
+// 65k appends and ~725 ms measured lock hold (probe: concurrent WriteAt
+// max latency 721.5 ms == flush duration 724.7 ms, 1:1), stretching to
+// ~35 s in-guest at production scale -- every write admitted by
+// awaitBackpressure then stalled in WriteAtCtx's buffering step behind
+// the flush. Batching decouples writers from flush I/O entirely.
+//
+// Correctness invariants, in order of subtlety:
+//   - Entries STAY in Writes.Blocks while their WAL append runs off-lock,
+//     and are removed only after it succeeds -- readers (both the
+//     BlockStore path and the scanning path) and same-block rewrites see
+//     no gap. Removal matches entries by SeqNum (globally unique per
+//     write), NEVER by block number: a concurrent rewrite of a block in
+//     the in-flight batch appends a new entry with a higher SeqNum, and
+//     that entry must survive this flush (the old block-number filter
+//     under the full lock could not race anything; a batched one could,
+//     and would lose the rewrite).
+//   - Snapshot order is preserved batch to batch (head of the buffer
+//     first), so per-block WAL record order remains SeqNum order.
+//   - Only the entries present when this Flush began are flushed (the
+//     entry-count budget): writes landing mid-flush belong to the next
+//     flush, matching the old snapshot semantics and bounding this
+//     flush's duration under sustained load.
+//   - Successfully appended entries move to PendingBackendWrites BEFORE
+//     being removed from Writes.Blocks, so the scanning read path always
+//     finds hot-or-pending data in at least one tier (hot wins ties).
+//   - BlockStore Hot->Pending transitions use the SeqNum-guarded variant:
+//     an off-lock flush of a superseded record must not mark the newer
+//     hot rewrite as pending (mirror of MarkPersisted's stale-drain
+//     guard).
+func (vb *VB) flushBatchedLegacy() error {
+	vb.Writes.mu.Lock()
+	remainingBudget := len(vb.Writes.Blocks)
+	vb.Writes.mu.Unlock()
+
+	totalAtStart := remainingBudget
+	writtenTotal := 0
+
+	for remainingBudget > 0 {
+		// Snapshot the head batch under the lock; entries remain in place.
+		vb.Writes.mu.Lock()
+		batchLen := min(flushBatchedBlocksPerLockRelease, min(remainingBudget, len(vb.Writes.Blocks)))
+		batch := make([]Block, batchLen)
+		copy(batch, vb.Writes.Blocks[:batchLen])
+		vb.Writes.mu.Unlock()
+		if batchLen == 0 {
+			break
+		}
+
+		// WAL appends off the lock: writers are not blocked by this I/O.
+		written := make([]Block, 0, batchLen)
+		writtenSeqNums := make(map[uint64]struct{}, batchLen)
+		var writeErr error
+		for _, block := range batch {
+			if err := vb.WriteWAL(block); err != nil {
+				vb.logger().Error("ERROR FLUSHING:", "block", block.Block, "error", err)
+				writeErr = err
+				break
+			}
+			written = append(written, block)
+			writtenSeqNums[block.SeqNum] = struct{}{}
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore.MarkPendingIfSeqNum(block.Block, block.SeqNum)
+			}
+		}
+
+		if len(written) > 0 {
+			// Hand to chunk assembly FIRST, then remove from the hot
+			// buffer, so readers never see a gap between the tiers.
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, written...)
+			vb.PendingBackendWrites.mu.Unlock()
+
+			vb.Writes.mu.Lock()
+			kept := vb.Writes.Blocks[:0]
+			for _, b := range vb.Writes.Blocks {
+				if _, flushed := writtenSeqNums[b.SeqNum]; !flushed {
+					kept = append(kept, b)
+				}
+			}
+			vb.Writes.Blocks = kept
+			vb.Writes.mu.Unlock()
+		}
+
+		writtenTotal += len(written)
+		remainingBudget -= batchLen
+
+		if writeErr != nil {
+			return fmt.Errorf("partial flush: %d of %d records flushed", writtenTotal, totalAtStart)
+		}
+	}
+
+	return nil
 }
 
 // DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
@@ -1959,62 +2082,10 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	return nil
 }
 
-// flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
-func (vb *VB) flushLocked() error {
-	flushBlocks := make([]Block, len(vb.Writes.Blocks))
-	copy(flushBlocks, vb.Writes.Blocks)
-
-	// flushed maps block number -> latest SeqNum that landed in the WAL,
-	// used to filter vb.Writes.Blocks and feed PendingBackendWrites. It
-	// dedupes by block number, so its cardinality CANNOT be used to detect
-	// partial flushes: when a hot block is rewritten N times in a window,
-	// N successful WriteWAL calls collapse into one map entry. successCount
-	// tracks records persisted, which is what "partial flush" actually means.
-	flushed := make(map[uint64]uint64)
-	successCount := 0
-
-	for _, block := range flushBlocks {
-		if err := vb.WriteWAL(block); err != nil {
-			vb.logger().Error("ERROR FLUSHING:", "block", block.Block, "error", err)
-			break
-		}
-
-		successCount++
-		flushed[block.Block] = block.SeqNum
-
-		// Mark block as Pending in BlockStore (Hot -> Pending transition)
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPending(block.Block)
-		}
-	}
-
-	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
-	if len(flushed) > 0 {
-		remaining := make([]Block, 0)
-		for _, b := range vb.Writes.Blocks {
-			if _, ok := flushed[b.Block]; !ok {
-				remaining = append(remaining, b)
-			}
-		}
-
-		vb.Writes.Blocks = remaining
-	}
-
-	// Append only successfully flushed blocks to PendingBackendWrites
-	vb.PendingBackendWrites.mu.Lock()
-	for _, b := range flushBlocks {
-		if _, ok := flushed[b.Block]; ok {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
-		}
-	}
-	vb.PendingBackendWrites.mu.Unlock()
-
-	if successCount < len(flushBlocks) {
-		return fmt.Errorf("partial flush: %d of %d records flushed", successCount, len(flushBlocks))
-	}
-
-	return nil
-}
+// flushLocked was the whole-buffer-under-Writes.mu legacy flush; REMOVED
+// 2026-07-28 (P1.6 slice 2) in favor of flushBatchedLegacy above, which
+// bounds the lock hold. The sharded variant below keeps the original
+// shape.
 
 // flushLockedSharded flushes hot writes to the sharded WAL in parallel.
 // Blocks are grouped by shard and written concurrently — one goroutine per shard.
@@ -2075,8 +2146,9 @@ func (vb *VB) flushLockedSharded() error {
 	wg.Wait()
 
 	// Merge flushed maps from all shards. allFlushed dedupes by block number
-	// so its cardinality CANNOT be used to detect partial flushes — see
-	// flushLocked. totalSuccess sums records persisted per shard.
+	// so its cardinality CANNOT be used to detect partial flushes (a hot
+	// block rewritten N times collapses into one entry). totalSuccess sums
+	// records persisted per shard.
 	allFlushed := make(map[uint64]uint64)
 	var firstErr error
 	totalSuccess := 0
