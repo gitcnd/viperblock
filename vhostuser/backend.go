@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -43,6 +44,14 @@ type Backend struct {
 	memoryRegions []MemoryRegion
 	guestMemory   *GuestMemory
 	queueState    vringState
+
+	// queueAccessMutex serialises the service goroutine's ring access
+	// against memory-table changes: QEMU legitimately re-sends
+	// SET_MEM_TABLE while the queue is live (observed during machine
+	// init on QEMU 7.2), and the live virtqueue's slices must be rebuilt
+	// against the new mapping -- never touched mid-swap. This was the
+	// 96%-CPU-spin wedge in the first real-QEMU smoke test (2026-07-28).
+	queueAccessMutex sync.Mutex
 
 	negotiatedFeatures         uint64
 	negotiatedProtocolFeatures uint64
@@ -150,8 +159,27 @@ func (b *Backend) handleMessage(connection *net.UnixConn, message *Message) erro
 			regions[i].MappedLocalBytes = mapped
 			unix.Close(message.FileDescriptors[i])
 		}
+
+		// Swap the mapping under the queue lock: a live queue's ring
+		// slices point into the OLD regions and must be rebuilt against
+		// the new table before any further ring access.
+		b.queueAccessMutex.Lock()
+		oldRegions := b.memoryRegions
 		b.memoryRegions = regions
 		b.guestMemory = &GuestMemory{Regions: regions}
+		var remapErr error
+		if b.queueState.queue != nil {
+			remapErr = b.remapLiveQueueLocked()
+		}
+		b.queueAccessMutex.Unlock()
+		for i := range oldRegions {
+			if oldRegions[i].MappedLocalBytes != nil {
+				_ = unix.Munmap(oldRegions[i].MappedLocalBytes)
+			}
+		}
+		if remapErr != nil {
+			return fmt.Errorf("remap live queue after mem-table change: %w", remapErr)
+		}
 		return b.ackIfNeeded(connection, message)
 
 	case RequestSetVringNum:
@@ -293,6 +321,35 @@ func (b *Backend) startQueueIfReady(connection *net.UnixConn, message *Message) 
 	return b.ackIfNeeded(connection, message)
 }
 
+// remapLiveQueueLocked rebuilds the running queue's ring slices against the
+// current guest memory, preserving the avail cursor. Caller holds
+// queueAccessMutex. The stored per-queue user addresses (from
+// SET_VRING_ADDR) are re-translated through the new region table, so a
+// remap that moved the rings is handled.
+func (b *Backend) remapLiveQueueLocked() error {
+	descriptorGPA, err := TranslateUserToGuestPhysical(b.memoryRegions, b.queueState.descriptorUserAddr)
+	if err != nil {
+		return fmt.Errorf("descriptor addr: %w", err)
+	}
+	availGPA, err := TranslateUserToGuestPhysical(b.memoryRegions, b.queueState.availUserAddr)
+	if err != nil {
+		return fmt.Errorf("avail addr: %w", err)
+	}
+	usedGPA, err := TranslateUserToGuestPhysical(b.memoryRegions, b.queueState.usedUserAddr)
+	if err != nil {
+		return fmt.Errorf("used addr: %w", err)
+	}
+	rebuilt, err := MapVirtQueue(b.guestMemory, b.queueState.sizeDescriptors, descriptorGPA, availGPA, usedGPA)
+	if err != nil {
+		return err
+	}
+	// Preserve the consumer cursor: the driver's avail index is authoritative
+	// in the ring, but lastSeenAvailIndex is ours and must carry over.
+	rebuilt.lastSeenAvailIndex = b.queueState.queue.lastSeenAvailIndex
+	b.queueState.queue = rebuilt
+	return nil
+}
+
 func (b *Backend) stopQueue() {
 	if b.queueState.running {
 		close(b.queueState.stopChannel)
@@ -313,19 +370,26 @@ func (b *Backend) serveQueueUntilStopped() {
 		if _, err := b.queueState.kickEventFile.Read(kickBuffer); err != nil {
 			return // eventfd closed = frontend gone
 		}
-		chains, err := b.queueState.queue.PopAvailableChains()
+		// Hold the queue lock across ring access so a concurrent
+		// SET_MEM_TABLE remap cannot swap the mapping mid-walk.
+		b.queueAccessMutex.Lock()
+		queue := b.queueState.queue
+		chains, err := queue.PopAvailableChains()
 		if err != nil {
+			b.queueAccessMutex.Unlock()
 			b.Logger.Error("vhost-user: ring walk failed", "err", err)
 			return
 		}
 		for _, chain := range chains {
 			bytesWritten := b.processBlockRequest(chain)
-			b.queueState.queue.PushUsed(chain, bytesWritten)
+			queue.PushUsed(chain, bytesWritten)
 		}
-		if len(chains) > 0 && b.queueState.callEventFile != nil {
+		callFile := b.queueState.callEventFile
+		b.queueAccessMutex.Unlock()
+		if len(chains) > 0 && callFile != nil {
 			one := make([]byte, 8)
 			binary.LittleEndian.PutUint64(one, 1)
-			_, _ = b.queueState.callEventFile.Write(one)
+			_, _ = callFile.Write(one)
 		}
 	}
 }

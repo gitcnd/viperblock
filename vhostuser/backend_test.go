@@ -176,6 +176,28 @@ func (f *syntheticFrontend) negotiate() {
 	f.sendMessage(RequestSetVringKick, 0, U64Payload(0), []int{kickFD})
 }
 
+// resendMemoryTableSameRegion re-sends SET_MEM_TABLE with the same memfd
+// and layout, as QEMU does during machine init. A fresh fd dup is sent so
+// the backend's munmap of the "old" region does not unmap the frontend's
+// own mapping.
+func (f *syntheticFrontend) resendMemoryTableSameRegion() {
+	f.t.Helper()
+	duplicateFD, err := unix.Dup(int(f.memoryFile.Fd()))
+	if err != nil {
+		f.t.Fatalf("dup memfd: %v", err)
+	}
+	defer unix.Close(duplicateFD)
+	memPayload := make([]byte, 8+32)
+	binary.LittleEndian.PutUint32(memPayload[0:4], 1)
+	binary.LittleEndian.PutUint64(memPayload[8:16], frontendGuestPhysicalBase)
+	binary.LittleEndian.PutUint64(memPayload[16:24], uint64(len(f.memoryBytes)))
+	binary.LittleEndian.PutUint64(memPayload[24:32], frontendFakeUserBase)
+	binary.LittleEndian.PutUint64(memPayload[32:40], 0)
+	f.sendMessage(RequestSetMemTable, 0, memPayload, []int{duplicateFD})
+	// Give the backend a moment to process the remap before the next kick.
+	time.Sleep(50 * time.Millisecond)
+}
+
 func (f *syntheticFrontend) receiveAfter(request uint32, payload []byte) []byte {
 	f.t.Helper()
 	f.sendMessage(request, 0, payload, nil)
@@ -296,6 +318,19 @@ func TestBackendEndToEndWriteReadFlush(t *testing.T) {
 	}
 	if engine.flushCount != 1 {
 		t.Fatalf("flush count = %d, want 1", engine.flushCount)
+	}
+
+	// Re-send SET_MEM_TABLE while the queue is LIVE (reproduces the QEMU
+	// realize-time behaviour that wedged the first smoke test). The
+	// backend must remap the live vring and keep serving.
+	frontend.resendMemoryTableSameRegion()
+	pattern2 := bytes.Repeat([]byte{0x11, 0x22}, 2048)
+	if status, _ := frontend.submitBlockRequest(BlockRequestTypeOut, 16, 4096, pattern2); status != BlockStatusOK {
+		t.Fatalf("post-remap write status = %d", status)
+	}
+	status, readBack2 := frontend.submitBlockRequest(BlockRequestTypeIn, 16, 4096, nil)
+	if status != BlockStatusOK || !bytes.Equal(readBack2, pattern2) {
+		t.Fatalf("post-remap read status=%d match=%v", status, bytes.Equal(readBack2, pattern2))
 	}
 
 	rawConnection.Close()
