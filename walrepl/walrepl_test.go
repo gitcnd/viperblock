@@ -123,3 +123,115 @@ func TestBarrierFailsWhenReplicaDies(t *testing.T) {
 		t.Fatal("barrier hung after replica death")
 	}
 }
+
+func TestReconnectingClientResyncsAfterReplicaRestart(t *testing.T) {
+	replicaDir := t.TempDir()
+	server := &ReplicaServer{ReplicaWALDirectoryPath: replicaDir}
+	address, err := server.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go server.Serve()
+
+	header := []byte("VBWL-RECONNECT-TEST")
+	rc, err := ConnectWithReconnect("tcp", address, "vol-reconnect", header, 0, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer rc.Close()
+
+	// Send 10 records and barrier.
+	for i := 0; i < 10; i++ {
+		record := bytes.Repeat([]byte{byte(i + 1)}, 100)
+		if err := rc.Append(record); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if err := rc.Barrier(); err != nil {
+		t.Fatalf("initial barrier: %v", err)
+	}
+
+	// Force connection break by closing the underlying client connection.
+	rc.mu.Lock()
+	if rc.client != nil {
+		rc.client.Close()
+	}
+	rc.mu.Unlock()
+
+	// Kill the old server and restart at the same address.
+	server.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	server2 := &ReplicaServer{ReplicaWALDirectoryPath: replicaDir}
+	_, err = server2.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("restart listen: %v", err)
+	}
+	go server2.Serve()
+	defer server2.Close()
+
+	// Send 10 more records (should trigger reconnect and resync).
+	for i := 10; i < 20; i++ {
+		record := bytes.Repeat([]byte{byte(i + 1)}, 100)
+		if err := rc.Append(record); err != nil {
+			t.Fatalf("append %d after reconnect: %v", i, err)
+		}
+	}
+
+	// Barrier should succeed after reconnect+resync.
+	if err := rc.Barrier(); err != nil {
+		t.Fatalf("barrier after reconnect: %v", err)
+	}
+
+	// Verify we have 2 replica files (one per connection).
+	time.Sleep(100 * time.Millisecond)
+	entries, err := os.ReadDir(replicaDir)
+	if err != nil {
+		t.Fatalf("read replica dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 replica files, got %d", len(entries))
+	}
+}
+
+func TestReconnectingClientEntersDegradedModeAfterExhaustion(t *testing.T) {
+	// Start a server, connect, then kill it permanently.
+	server := &ReplicaServer{ReplicaWALDirectoryPath: t.TempDir()}
+	address, err := server.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go server.Serve()
+
+	rc, err := ConnectWithReconnect("tcp", address, "vol-test", []byte("H"), 3, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer rc.Close()
+
+	// Force connection break by closing the underlying client.
+	rc.mu.Lock()
+	if rc.client != nil {
+		rc.client.Close()
+	}
+	rc.mu.Unlock()
+
+	// Kill the server permanently so reconnect attempts will fail.
+	server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Append should trigger reconnect, exhaust 3 attempts, and enter degraded mode.
+	err = rc.Append(make([]byte, 100))
+	if err == nil {
+		t.Fatal("expected append to fail with degraded mode error, got nil")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("degraded mode")) {
+		t.Fatalf("expected degraded mode error on first operation, got: %v", err)
+	}
+
+	// Subsequent operations should also fail with degraded mode.
+	err = rc.Barrier()
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("degraded mode")) {
+		t.Fatalf("expected degraded mode error on barrier, got: %v", err)
+	}
+}

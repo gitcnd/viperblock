@@ -379,11 +379,23 @@ type VB struct {
 	// from inside the WAL write lock) and participates in the flush
 	// barrier: Flush() returns only after the replica has acknowledged
 	// durability of everything appended (fork F2: synchronous peer WAL
-	// replication, human-acked 2026-07-28). Set post-construction, before
-	// serving IO. A broken replica FAILS the barrier -- degraded-mode
-	// policy (detach/alarm/re-pair) is a later slice, tracked in the
-	// spinifex project plan.
+	// replication, human-acked 2026-07-28, reconnect/resync 2026-07-29).
+	// Set post-construction, before serving IO. Use walrepl.ReconnectingClient
+	// for automatic reconnect with configurable degraded-mode policy
+	// (see ReplicationReconnectAttempts).
 	Replicator WALReplicator
+
+	// ReplicationReconnectAttempts bounds reconnect attempts when using
+	// walrepl.ReconnectingClient (0 = retry forever, N = enter degraded mode
+	// after N failures). Degraded mode behavior depends on the Replicator
+	// implementation: walrepl.ReconnectingClient returns permanent errors.
+	// Ignored if Replicator is nil or not a ReconnectingClient.
+	ReplicationReconnectAttempts int
+
+	// ReplicationInitialBackoff is the first sleep between reconnect attempts
+	// (doubling on each retry, max 30s). Defaults to 100ms if zero.
+	// Ignored if Replicator is not a ReconnectingClient.
+	ReplicationInitialBackoff time.Duration
 
 	// SyncOnFlush makes Flush() a DURABLE barrier: after draining the
 	// memory buffer into the WAL, the active WAL file is fsynced before

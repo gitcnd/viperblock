@@ -10,9 +10,8 @@
 // The handshake carries the volume name and the primary's WAL file header,
 // so replica files are valid WAL files a future promotion can recover from.
 //
-// Out of scope in this slice (tracked in the spinifex project plan):
-// automatic promotion, reconnect/resync after replica loss, sharded-WAL
-// replication, multi-replica quorum.
+// Out of scope in initial slice (reconnect/resync landed 2026-07-29):
+// sharded-WAL replication, multi-replica quorum.
 package walrepl
 
 import (
@@ -226,6 +225,40 @@ type Client struct {
 	connectionBroken error
 }
 
+// ReconnectingClient wraps Client with automatic reconnect and resync
+// capabilities (F2 reconnect slice 2026-07-29). When the replica connection
+// breaks, it attempts reconnect with exponential backoff. On successful
+// reconnect, it resyncs all pending (unacked) records before resuming normal
+// operation. Degraded mode: if ReconnectAttempts is exhausted, the client
+// enters degraded mode where Append/Barrier return a permanent error.
+type ReconnectingClient struct {
+	network    string
+	address    string
+	volumeName string
+	walHeader  []byte
+
+	// ReconnectAttempts bounds reconnect attempts per disconnection
+	// (0 means retry forever). Exhaustion enters degraded mode.
+	ReconnectAttempts int
+	// InitialReconnectBackoff is the first sleep between reconnect attempts,
+	// doubling on each subsequent retry (max 30s per attempt).
+	InitialReconnectBackoff time.Duration
+
+	mu                  sync.Mutex
+	client              *Client
+	pendingRecords      []pendingRecord
+	nextSequence        uint64
+	degradedMode        bool
+	degradedModeError   error
+	ackCondition        *sync.Cond
+	reconnectInProgress bool
+}
+
+type pendingRecord struct {
+	sequence uint64
+	data     []byte
+}
+
 // Connect dials the replica and performs the handshake.
 func Connect(network, address, volumeName string, walHeader []byte) (*Client, error) {
 	connection, err := net.Dial(network, address)
@@ -311,6 +344,264 @@ func (c *Client) Barrier() error {
 }
 
 func (c *Client) Close() error { return c.connection.Close() }
+
+// -------------------------------------------------------- reconnecting client --
+
+// ConnectWithReconnect creates a ReconnectingClient that automatically
+// reconnects and resyncs on connection loss. Set reconnectAttempts to 0 for
+// infinite retries, or a positive number to enter degraded mode after that
+// many failures. initialBackoff defaults to 100ms if zero.
+func ConnectWithReconnect(network, address, volumeName string, walHeader []byte, reconnectAttempts int, initialBackoff time.Duration) (*ReconnectingClient, error) {
+	if initialBackoff == 0 {
+		initialBackoff = 100 * time.Millisecond
+	}
+	rc := &ReconnectingClient{
+		network:                 network,
+		address:                 address,
+		volumeName:              volumeName,
+		walHeader:               walHeader,
+		ReconnectAttempts:       reconnectAttempts,
+		InitialReconnectBackoff: initialBackoff,
+	}
+	rc.ackCondition = sync.NewCond(&rc.mu)
+
+	client, err := Connect(network, address, volumeName, walHeader)
+	if err != nil {
+		return nil, fmt.Errorf("initial connect: %w", err)
+	}
+	rc.client = client
+	return rc, nil
+}
+
+// Append streams one WAL record with automatic reconnect/resync on failure.
+func (rc *ReconnectingClient) Append(record []byte) error {
+	rc.mu.Lock()
+
+	if rc.degradedMode {
+		rc.mu.Unlock()
+		return rc.degradedModeError
+	}
+
+	rc.nextSequence++
+	sequence := rc.nextSequence
+
+	// Store the record in pending buffer for potential resync.
+	rc.pendingRecords = append(rc.pendingRecords, pendingRecord{
+		sequence: sequence,
+		data:     append([]byte(nil), record...),
+	})
+
+	// Try to send to the current client (unlocked to avoid deadlock with receiveAcks).
+	client := rc.client
+	rc.mu.Unlock()
+
+	if client != nil {
+		err := client.Append(record)
+		if err == nil {
+			return nil // Success; record will be pruned on next successful barrier.
+		}
+		// Connection broken; trigger reconnect.
+		fmt.Fprintf(os.Stderr, "walrepl: append seq=%d failed, triggering reconnect: %v\n", sequence, err)
+		rc.mu.Lock()
+		rc.triggerReconnectLocked()
+		rc.mu.Unlock()
+	}
+
+	// Client is nil or broken; wait for reconnect to complete.
+	// The record is already in pendingRecords, so resync will send it.
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	for rc.reconnectInProgress && !rc.degradedMode {
+		rc.ackCondition.Wait()
+	}
+
+	if rc.degradedMode {
+		return rc.degradedModeError
+	}
+
+	// Reconnect completed; the record was sent during resync.
+	return nil
+}
+
+// Barrier blocks until everything appended is durable on the replica, with
+// automatic reconnect/resync if the connection breaks during the wait.
+func (rc *ReconnectingClient) Barrier() error {
+	rc.mu.Lock()
+
+	if rc.degradedMode {
+		rc.mu.Unlock()
+		return rc.degradedModeError
+	}
+
+	target := rc.nextSequence
+	if target == 0 {
+		rc.mu.Unlock()
+		return nil // Nothing to barrier.
+	}
+
+	for {
+		client := rc.client
+		rc.mu.Unlock()
+
+		if client != nil {
+			err := client.Barrier()
+			if err == nil {
+				// Barrier succeeded; prune acked records from pending buffer.
+				rc.mu.Lock()
+				client.mu.Lock()
+				highestAcked := client.highestAcked
+				client.mu.Unlock()
+				rc.prunePendingRecordsLocked(highestAcked)
+				rc.mu.Unlock()
+				return nil
+			}
+			// Barrier failed; trigger reconnect.
+			fmt.Fprintf(os.Stderr, "walrepl: barrier failed, triggering reconnect: %v\n", err)
+			rc.mu.Lock()
+			rc.triggerReconnectLocked()
+		} else {
+			rc.mu.Lock()
+		}
+
+		if rc.degradedMode {
+			rc.mu.Unlock()
+			return rc.degradedModeError
+		}
+
+		// Wait for reconnect to complete and retry barrier.
+		for rc.reconnectInProgress && !rc.degradedMode {
+			rc.ackCondition.Wait()
+		}
+
+		if rc.degradedMode {
+			rc.mu.Unlock()
+			return rc.degradedModeError
+		}
+	}
+}
+
+// triggerReconnectLocked starts a reconnect goroutine if not already running.
+// Caller must hold rc.mu.
+func (rc *ReconnectingClient) triggerReconnectLocked() {
+	if rc.client != nil {
+		rc.client.Close()
+		rc.client = nil
+	}
+
+	if rc.reconnectInProgress {
+		return // Already reconnecting.
+	}
+
+	rc.reconnectInProgress = true
+	go rc.reconnectLoop()
+}
+
+// reconnectLoop attempts reconnection with exponential backoff, then resyncs
+// all pending records. On success, clears reconnectInProgress and broadcasts.
+// On exhaustion, enters degraded mode.
+func (rc *ReconnectingClient) reconnectLoop() {
+	backoff := rc.InitialReconnectBackoff
+	maxBackoff := 30 * time.Second
+	attempts := 0
+
+	for {
+		if rc.ReconnectAttempts > 0 && attempts >= rc.ReconnectAttempts {
+			rc.enterDegradedMode(fmt.Errorf("reconnect exhausted after %d attempts", attempts))
+			return
+		}
+
+		attempts++
+		fmt.Fprintf(os.Stderr, "walrepl: reconnect attempt %d to %s\n", attempts, rc.address)
+
+		client, err := Connect(rc.network, rc.address, rc.volumeName, rc.walHeader)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "walrepl: reconnect attempt %d failed: %v\n", attempts, err)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Reconnect succeeded; resync pending records.
+		fmt.Fprintf(os.Stderr, "walrepl: reconnect succeeded, resyncing %d pending records\n", len(rc.pendingRecords))
+		if err := rc.resyncPendingRecords(client); err != nil {
+			fmt.Fprintf(os.Stderr, "walrepl: resync failed: %v\n", err)
+			client.Close()
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Resync succeeded; install the new client and signal waiters.
+		rc.mu.Lock()
+		rc.client = client
+		rc.reconnectInProgress = false
+		rc.ackCondition.Broadcast()
+		rc.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "walrepl: reconnect and resync complete\n")
+		return
+	}
+}
+
+// resyncPendingRecords sends all pending (unacked) records to the new client
+// in sequence order. Caller must NOT hold rc.mu (to avoid deadlock with Append).
+func (rc *ReconnectingClient) resyncPendingRecords(client *Client) error {
+	rc.mu.Lock()
+	pending := make([]pendingRecord, len(rc.pendingRecords))
+	copy(pending, rc.pendingRecords)
+	rc.mu.Unlock()
+
+	for _, pr := range pending {
+		if err := client.Append(pr.data); err != nil {
+			return fmt.Errorf("resync record seq=%d: %w", pr.sequence, err)
+		}
+	}
+
+	// Barrier to ensure all resynced records are durable.
+	if err := client.Barrier(); err != nil {
+		return fmt.Errorf("resync barrier: %w", err)
+	}
+
+	return nil
+}
+
+// prunePendingRecordsLocked removes all records with sequence <= highestAcked
+// from the pending buffer. Caller must hold rc.mu.
+func (rc *ReconnectingClient) prunePendingRecordsLocked(highestAcked uint64) {
+	keep := rc.pendingRecords[:0]
+	for _, pr := range rc.pendingRecords {
+		if pr.sequence > highestAcked {
+			keep = append(keep, pr)
+		}
+	}
+	rc.pendingRecords = keep
+}
+
+// enterDegradedMode permanently marks the client as degraded (no replica).
+func (rc *ReconnectingClient) enterDegradedMode(err error) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.degradedMode = true
+	rc.degradedModeError = fmt.Errorf("walrepl degraded mode: %w", err)
+	rc.reconnectInProgress = false
+	rc.ackCondition.Broadcast()
+	fmt.Fprintf(os.Stderr, "walrepl: entered degraded mode: %v\n", err)
+}
+
+func (rc *ReconnectingClient) Close() error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.client != nil {
+		return rc.client.Close()
+	}
+	return nil
+}
 
 // ------------------------------------------------------- buffered reader --
 
